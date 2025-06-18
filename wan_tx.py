@@ -17,6 +17,39 @@ from jax.tree_util import register_pytree_node
 
 from transformers import modeling_outputs
 
+from datetime import datetime
+
+
+#### SETTINGS
+# 1.3B
+# MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+# 14B
+MODEL_ID = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+
+# 384p
+# FLOW_SHIFT = 3.0 # 5.0 for 720P, 3.0 for 480P
+# WIDTH = 640
+# HEIGHT = 384
+# 480p
+# FLOW_SHIFT = 3.0 # 5.0 for 720P, 3.0 for 480P
+# WIDTH = 832
+# HEIGHT = 480
+# 720p
+FLOW_SHIFT = 5.0 # 5.0 for 720P, 3.0 for 480P
+WIDTH = 1280
+HEIGHT = 720
+
+# 41 frames
+# FRAMES = 41
+# FPS = 8
+
+# 81 frames
+FRAMES = 81
+FPS = 16
+
+####
+
+
 axis = 'axis'
 
 # Sharding for tranformers, all the replicated are commented out for speed
@@ -150,9 +183,11 @@ def main():
   torch.set_default_dtype(torch.bfloat16)
   # Available models: Wan-AI/Wan2.1-T2V-14B-Diffusers, Wan-AI/Wan2.1-T2V-1.3B-Diffusers
   #model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-  model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+  # model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+  model_id = MODEL_ID
   vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.bfloat16)
-  flow_shift = 5.0 # 5.0 for 720P, 3.0 for 480P
+  # flow_shift = 5.0 # 5.0 for 720P, 3.0 for 480P
+  flow_shift = FLOW_SHIFT
   scheduler = UniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
   pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16)
   pipe.scheduler = scheduler
@@ -243,35 +278,37 @@ def main():
 
 
   prompt = "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window."
+  # prompt = "Drone view of waves crashing against the rugged cliffs along Big Sur's garay point beach.The crashing blue waters create white-tipped waves,while the golden light of the setting sun illuminates the rocky shore. A small island with a lighthouse sits in the distance, and greenshrubbery covers the cliffs edge. The steep drop from the road down to the beach is adramatic feat, with the cliff's edges jutting out over the sea. This is a view that captures the raw beauty of the coast and the rugged landscape of the Pacific Coast Highway."
   negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
-  long_prompt = "Drone view of waves crashing against the rugged cliffs along Big Sur's garay point beach.The crashing blue waters create white-tipped waves,while the golden light of the setting sun illuminates the rocky shore. A small island with a lighthouse sits in the distance, and greenshrubbery covers the cliffs edge. The steep drop from the road down to the beach is adramatic feat, with the cliff's edges jutting out over the sea. This is a view that captures the raw beauty of the coast and the rugged landscape of the Pacific Coast Highway."
 
   with mesh:
     outputs = []
     for i in range(5):
       start = time.perf_counter()
       if i == 3:
-        jax.profiler.start_trace('/tmp/tensorboard')
+        jax.profiler.start_trace('/tmp/profiler/wan')
       output = pipe(
           prompt=prompt,
           negative_prompt=negative_prompt,
-          #height=384,
-          #width=640,
+          height=HEIGHT,
+          width=WIDTH,
           num_inference_steps=50,
-          height=720,
-          width=1280,
-          num_frames=81,
+          # height=720,
+          # width=1280,
+          num_frames=FRAMES, ### YYY: OOM use 41, need 81
           guidance_scale=5.0,
           ).frames[0]
       if i == 4:
+        jax.effects_barrier()
         jax.profiler.stop_trace()
         break
       end = time.perf_counter()  
       print(f'Iteration {i}: {end - start:.6f}s')
       outputs.append(output)
 
-    export_to_video(outputs[0], "output.mp4", fps=16)
+    current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")    
+    export_to_video(outputs[0], f"{current_datetime}.mp4", fps=FPS) ### YYY: fps16
     print('DONE')
 
   #print(f'生成视频时长= {(num_frams-1)/fps} - 目前针对1.3B生成5s = (41-1)/8)
