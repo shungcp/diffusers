@@ -18,38 +18,44 @@ from transformers import modeling_outputs
 
 from datetime import datetime
 
+# import torchax.ops.jtorch
+
 
 #### SETTINGS
 # 1.3B
-# MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 # 14B
-MODEL_ID = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+# MODEL_ID = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
 
 # 384p
-# FLOW_SHIFT = 3.0 # 5.0 for 720P, 3.0 for 480P
-# WIDTH = 640
-# HEIGHT = 384
+FLOW_SHIFT = 3.0 # 5.0 for 720P, 3.0 for 480P
+WIDTH = 640
+HEIGHT = 384
 # 480p
 # FLOW_SHIFT = 3.0 # 5.0 for 720P, 3.0 for 480P
 # WIDTH = 832
 # HEIGHT = 480
 # 720p
-FLOW_SHIFT = 5.0 # 5.0 for 720P, 3.0 for 480P
-WIDTH = 1280
-HEIGHT = 720
+# FLOW_SHIFT = 5.0 # 5.0 for 720P, 3.0 for 480P
+# WIDTH = 1280
+# HEIGHT = 720
 
 # 41 frames
-# FRAMES = 41
-# FPS = 8
+FRAMES = 41
+FPS = 8
 
 # 81 frames
-FRAMES = 81
-FPS = 16
+# FRAMES = 81
+# FPS = 16
+
+# step
+NUM_STEP = 50
+# NUM_STEP = 1
 
 ####
 
 
-axis = 'axis'
+axis = 'tp'
 
 # Sharding for tranformers, all the replicated are commented out for speed
 transformer_shardings = {
@@ -207,8 +213,13 @@ def main():
 
   torchax.enable_globally()
   env = torchax.default_env()
-  mesh = jax.make_mesh((len(jax.devices()), ), (axis, ))
+  mesh = jax.make_mesh((len(jax.devices()), 1), (axis, "fsdp"))
   env.default_device_or_sharding = NamedSharding(mesh, P())
+
+  env._mesh = mesh
+  env.config.use_tpu_flash_attention = True
+  env.config.shmap_flash_attention = True
+
 
   vae_options = torchax.CompileOptions(
     methods_to_compile=['decode']
@@ -284,7 +295,8 @@ def main():
           negative_prompt=negative_prompt,
           height=HEIGHT,
           width=WIDTH,
-          num_inference_steps=50,
+          # num_inference_steps=50,
+          num_inference_steps=NUM_STEP,
           # height=720,
           # width=1280,
           num_frames=FRAMES, ### YYY: OOM use 41, need 81
@@ -298,8 +310,10 @@ def main():
       print(f'Iteration {i}: {end - start:.6f}s')
       outputs.append(output)
 
-    current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")    
-    export_to_video(outputs[0], f"{current_datetime}.mp4", fps=FPS) ### YYY: fps16
+      current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
+      export_to_video(output, f"{current_datetime}.mp4", fps=FPS)
+      print("output video done.")
+      break
     print('DONE')
 
   #print(f'生成视频时长= {(num_frams-1)/fps} - 目前针对1.3B生成5s = (41-1)/8)

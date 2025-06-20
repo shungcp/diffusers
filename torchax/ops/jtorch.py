@@ -152,68 +152,55 @@ def _sdpa_reference(
 from jax.sharding import PartitionSpec
 
 
-def get_partition_spec(shape, mesh_axis_size):
-    # shape: tuple, e.g. (1, 1, 15360, 384)
-    # mesh_axis_size: int, e.g. 8
-    for i, dim in enumerate(shape):
-        if dim % mesh_axis_size == 0 and dim >= mesh_axis_size:
-            # 构造 PartitionSpec，把 mesh axis 分配到第i维
-            spec = [None] * len(shape)
-            spec[i] = 'axis'
-            print(f"[DEBUG] Using PartitionSpec for sharding: {spec} for shape {shape}")
-            return tuple(spec)
-    # 如果没有合适的维度，返回全None（不分shard）
-    print(f"[DEBUG] No suitable sharding axis found for shape {shape} and mesh_axis_size {mesh_axis_size}, using no sharding.")
-    return tuple([None] * len(shape))
-
-
 def _tpu_flash_attention(query, key, value, env):
-    mesh_axis_size = list(env._mesh.shape.values())[0]
-    fsdp_partition = PartitionSpec(*get_partition_spec(query.shape, mesh_axis_size))
+  fsdp_partition = PartitionSpec("fsdp")
 
-    def get_block_k_major(kv_seq_len, default=512):
-        # 选小于等于kv_seq_len的最大128倍数，且能整除kv_seq_len
-        for candidate in range(min(default, kv_seq_len), 127, -128):
-            if kv_seq_len % candidate == 0:
-                return candidate
-        return kv_seq_len  # fallback: 用kv_seq_len本身（不推荐，显存大）
+  def wrap_flash_attention(query, key, value):
+    block_sizes = flash_attention.BlockSizes(
+        block_b=min(2, query.shape[0]),
+        block_q=min(512, query.shape[2]),
+        block_k_major=min(512, key.shape[2]),
+        block_k=min(512, key.shape[2]),
+        block_q_major_dkv=min(512, query.shape[2]),
+        block_k_major_dkv=min(512, key.shape[2]),
+        block_k_dkv=min(512, key.shape[2]),
+        block_q_dkv=min(512, query.shape[2]),
+        block_k_major_dq=min(512, key.shape[2]),
+        block_k_dq=min(256, key.shape[2]),
+        block_q_dq=min(1024, query.shape[2]),
+    )
 
-    def get_block_k(block_k_major):
-        # 选小于block_k_major的最大128倍数，且能整除block_k_major
-        for candidate in range(min(512, block_k_major-128), 127, -128):
-            if block_k_major % candidate == 0:
-                return candidate
-        return block_k_major // 2  # fallback
+    # key shape: (1, head seq, dim)
+    # pad key and value seq to a multiple of 512 block size for flash attention
+    seq_len = key.shape[2]
+    pad_to = 512
+    q_segment_ids = jnp.ones((query.shape[0], query.shape[2]), dtype=jnp.int32)
+    kv_segment_ids = jnp.ones((key.shape[0], key.shape[2]), dtype=jnp.int32)
+    segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
+    if seq_len % pad_to != 0:
+        padding_needed = pad_to - (seq_len % pad_to)
+        pad_width = [(0,0) for _ in range(len(key.shape))]
+        pad_width[-2] = (0, padding_needed)
+        padded_key = jnp.pad(key, pad_width)
+        padded_value = jnp.pad(value, pad_width)
+        segment_ids = flash_attention.SegmentIds(q_segment_ids, jnp.pad(segment_ids.kv, ((0, 0), (0, padding_needed))))
+    else:
+        padded_key = key
+        padded_value = value
 
-    def wrap_flash_attention(query, key, value):
-        block_k_major = get_block_k_major(key.shape[2])
-        block_k = get_block_k(block_k_major)
+    return flash_attention.flash_attention(
+        query, padded_key, padded_value, segment_ids=segment_ids, causal=False, block_sizes=block_sizes)
 
-        block_sizes = flash_attention.BlockSizes(
-            block_b=min(2, query.shape[0]),
-            block_q=min(512, query.shape[2]),
-            block_k_major=block_k_major, #min(512, key.shape[2]),
-            block_k=block_k, #min(512, key.shape[2]),
-            block_q_major_dkv=min(512, query.shape[2]),
-            block_k_major_dkv=min(512, key.shape[2]),
-            block_k_dkv=min(512, key.shape[2]),
-            block_q_dkv=min(512, query.shape[2]),
-            block_k_major_dq=min(512, key.shape[2]),
-            block_k_dq=min(256, key.shape[2]),
-            block_q_dq=min(1024, query.shape[2]),
-        )
-        return flash_attention.flash_attention(
-            query, key, value, causal=True, block_sizes=block_sizes)
-
-    if env.config.shmap_flash_attention:
-        wrap_flash_attention = shard_map(
-            wrap_flash_attention,
-            mesh=env._mesh,
-            in_specs=(fsdp_partition, fsdp_partition, fsdp_partition),
-            out_specs=fsdp_partition,
-            check_rep=False,
-        )
-    return wrap_flash_attention(query, key, value)
+  if env.config.shmap_flash_attention:
+    wrap_flash_attention = shard_map(
+        wrap_flash_attention,
+        mesh=env._mesh,
+        in_specs=(fsdp_partition, fsdp_partition, fsdp_partition),
+        out_specs=fsdp_partition,
+        check_rep=False,
+    )
+  # return flash_attn_mapped(query, key, value)
+  return wrap_flash_attention(query, key, value)
 
 
 @register_function(torch.nn.functional.pad)
