@@ -5,7 +5,6 @@ import torchax
 import time
 import jax
 
-from jax.experimental import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
@@ -208,18 +207,10 @@ def main():
 
   torchax.enable_globally()
   env = torchax.default_env()
-
-  env.config.use_tpu_flash_attention = True
-  env.config.shmap_flash_attention = True
-
   mesh = jax.make_mesh((len(jax.devices()), ), (axis, ))
-
-  env._mesh = mesh
   env.default_device_or_sharding = NamedSharding(mesh, P())
 
-  torchax.default_env()._mesh = mesh
-
-  _vae_options = torchax.CompileOptions(
+  vae_options = torchax.CompileOptions(
     methods_to_compile=['decode']
   )
   _move_module(pipe.vae)

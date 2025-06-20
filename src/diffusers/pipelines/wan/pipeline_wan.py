@@ -324,32 +324,13 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         if latents is not None:
             return latents.to(device=device, dtype=dtype)
 
-        num_latent_frames = 8 #(num_frames - 1) // self.vae_scale_factor_temporal + 1
-        #num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-
-        ## --- 请将这个辅助函数放到你的类的方法里或者一个工具文件里 ---
-        #def _round_to_nearest_multiple(self, value, multiple):
-        #"""将数值 round 到最接近的 multiple 的倍数。"""
-        #    return int(round(value / multiple) * multiple)
-
-        ## 1. 先计算出原始的 latent 空间高和宽
-        #latent_height_raw = int(height) // self.vae_scale_factor_spatial
-        #latent_width_raw = int(width) // self.vae_scale_factor_spatial
-
-        ## 2. 将它们 round 到最接近的 16 的倍数
-        #aligned_height = self._round_to_nearest_multiple(latent_height_raw, 16)
-        #aligned_width = self._round_to_nearest_multiple(latent_width_raw, 16)
-
+        num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         shape = (
             batch_size,
             num_channels_latents,
             num_latent_frames,
-            int(round((int(height) // self.vae_scale_factor_spatial) / 16)) * 16,
-            int(round((int(width) // self.vae_scale_factor_spatial) / 16)) * 16,
-            #aligned_height,
-            #aligned_width,
-            #int(height) // self.vae_scale_factor_spatial,
-            #int(width) // self.vae_scale_factor_spatial,
+            int(height) // self.vae_scale_factor_spatial,
+            int(width) // self.vae_scale_factor_spatial,
         )
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
