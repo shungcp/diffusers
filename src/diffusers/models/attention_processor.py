@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from jax.sharding import PartitionSpec as P
 import inspect
 import math
 from typing import Callable, List, Optional, Tuple, Union
@@ -3302,6 +3303,11 @@ class AttnProcessor2_0:
 
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        breakpoint()
+
+        query.shard_(P(None, None, 'axis', None))
+        key.shard_(P(None, None, 'axis', None))
+        value.shard_(P(None, None, 'axis', None))
 
         if attn.norm_q is not None:
             query = attn.norm_q(query)
@@ -3330,6 +3336,8 @@ class AttnProcessor2_0:
 
         hidden_states = hidden_states / attn.rescale_output_factor
 
+        # replicate everything? 
+        hidden_states.shard(P())
         return hidden_states
 
 
