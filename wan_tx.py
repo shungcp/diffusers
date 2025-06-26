@@ -232,7 +232,7 @@ def _tpu_flash_attention(query, key, value, env):
 
   def wrap_flash_attention(query, key, value):
     block_sizes = flash_attention.BlockSizes(
-        block_b=min(2, query.shape[0]),
+        block_b=min(1, query.shape[0]),
         block_q=min(2048, query.shape[2]),
         block_k_major=min(2048, key.shape[2]),
         block_k=min(2048, key.shape[2]),

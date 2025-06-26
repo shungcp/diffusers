@@ -529,34 +529,29 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         self._num_timesteps = len(timesteps)
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
+            assert self.do_classifier_free_guidance, "Current implementation only support stacking embeding unconditionally"
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
 
                 self._current_timestep = t
-                latent_model_input = latents.to(transformer_dtype)
+                latent_model_input = torch.cat([latents, latents]).to(transformer_dtype)
                 timestep = t.expand(latents.shape[0])
+                hidden_state = torch.cat([prompt_embeds, negative_prompt_embeds])
 
-                noise_pred = self.transformer(
+                stacked_noise = self.transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
+                    encoder_hidden_states=hidden_state,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
 
-                if self.do_classifier_free_guidance:
-                    noise_uncond = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                    noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+                noise_pred, noise_pred_uncond = stacked_noise.chunk(2)
+                noise_pred_effective = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                latents = self.scheduler.step(noise_pred_effective, t, latents, return_dict=False)[0]
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
