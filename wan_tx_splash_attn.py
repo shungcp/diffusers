@@ -175,10 +175,10 @@ def _shard_weight_dict(weight_dict, sharding_dict, mesh):
   return result
 
   
-def _shard_weight_fsdp(weight_dict, mesh):
+def _shard_weight_fsdp(weight_dict, sh, mesh):
   result = {}
   for k, v in weight_dict.items():
-    if len(v.shape) >= 2:
+    if len(v.shape) == 2:
       v.apply_jax_(jax.device_put, NamedSharding(mesh, P('axis')))
     else:
       v.apply_jax_(jax.device_put, NamedSharding(mesh, P()))
@@ -735,7 +735,7 @@ def main():
   pipe.text_encoder = torchax.compile(pipe.text_encoder)
 
 
-  pipe.transformer = quantize.quantize_model(pipe.transformer)
+  #pipe.transformer = quantize.quantize_model(pipe.transformer)
   # the param below is not declared as param or buffer so the module.to('jax') didnt work
   _move_module(pipe.transformer)
   pipe.transformer.rope.freqs = pipe.transformer.rope.freqs.to('jax')
