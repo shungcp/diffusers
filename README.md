@@ -13,6 +13,8 @@ pip install jax[tpu]
 
 To run:
 
+sudo sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled"
+
 ```
 python wan_tx.py
 ```

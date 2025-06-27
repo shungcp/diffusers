@@ -1,3 +1,4 @@
+import quantize
 import functools
 import re
 import math
@@ -7,32 +8,13 @@ from torchax.ops import ops_registry
 import time
 import jax
 import jax.numpy as jnp
-import numpy as np
-import quantize
 
 from jax.experimental.pallas.ops.tpu import splash_attention
 from jax.experimental.shard_map import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
-from torchax import interop
-
-# Add JAX VAE imports
-from flax import nnx
-from maxdiffusion.models.wan.autoencoder_kl_wan import (
-    WanCausalConv3d,
-    WanUpsample,
-    AutoencoderKLWan,
-    WanMidBlock,
-    WanResidualBlock,
-    WanRMS_norm,
-    WanResample,
-    ZeroPaddedConv2D,
-    WanAttentionBlock,
-    AutoencoderKLWanCache,
-)
-from maxdiffusion.models.wan.wan_utils import load_wan_vae
 
 from diffusers.utils import export_to_video
-from diffusers import AutoencoderKLWan as TorchAutoencoderKLWan, WanPipeline
+from diffusers import AutoencoderKLWan, WanPipeline
 from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
 from jax.tree_util import register_pytree_node
@@ -43,7 +25,6 @@ from datetime import datetime
 
 # import torchax.ops.jtorch
 import traceback
-import types
 
 #### SETTINGS
 # 1.3B
@@ -51,10 +32,22 @@ import types
 # 14B
 MODEL_ID = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
 
+# 384p
+# FLOW_SHIFT = 3.0 # 5.0 for 720P, 3.0 for 480P
+# WIDTH = 640
+# HEIGHT = 384
+# 480p
+# FLOW_SHIFT = 3.0 # 5.0 for 720P, 3.0 for 480P
+# WIDTH = 832
+# HEIGHT = 480
 # 720p
 FLOW_SHIFT = 5.0 # 5.0 for 720P, 3.0 for 480P
 WIDTH = 1280
 HEIGHT = 720
+
+# 41 frames
+# FRAMES = 41
+# FPS = 8
 
 # 81 frames
 FRAMES = 81
@@ -66,7 +59,6 @@ NUM_STEP = 50
 
 BQSIZE =  2520 # 2240 # 3024 #2520
 BKVSIZE = 1024 # 2048 # 2304 # 1664 #2048
-
 
 # <--- NEW: Local Attention Window Size Setting --->
 # window_size = (left, right). (128, 0) means each token can attend to itself and the previous 128 tokens.
@@ -81,6 +73,7 @@ PROFILE_OUT_PATH = "/tmp/tensorboard"
 
 axis = 'axis'
 
+# Sharding for tranformers, all the replicated are commented out for speed
 transformer_shardings = {
 # 'scale_shift_table': (), # (torch.Size([1, 2, 1536]), torch.float32)
 # 'patch_embedding.weight': (), # (torch.Size([1536, 16, 1, 2, 2]), torch.bfloat16)
@@ -174,18 +167,6 @@ def _shard_weight_dict(weight_dict, sharding_dict, mesh):
     result[k] = v
   return result
 
-  
-def _shard_weight_fsdp(weight_dict, sh, mesh):
-  result = {}
-  for k, v in weight_dict.items():
-    if len(v.shape) == 2:
-      v.apply_jax_(jax.device_put, NamedSharding(mesh, P('axis')))
-    else:
-      v.apply_jax_(jax.device_put, NamedSharding(mesh, P()))
-    result[k] = v
-  return result
-
-
 
 def flatten_model_output(obj):
   return obj.to_tuple(), type(obj)
@@ -278,6 +259,9 @@ CF_FOR_ALL_REDUCE_AND_ALL_GATHER = (
     " --xla_tpu_enable_async_collective_fusion=true"
     " --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true"
     " --xla_tpu_enable_async_collective_fusion_multiple_steps=true"
+    " --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true"
+    " --xla_tpu_decompose_all_gather_einsum=true"
+    " --xla_tpu_decompose_einsum_reduce_scatter=true"
 )
 import os
 os.environ['LIBTPU_INIT_ARGS'] = CF_FOR_ALL_REDUCE_AND_ALL_GATHER
@@ -304,7 +288,7 @@ def _tpu_splash_attention(query, key, value, env, scale=None, is_causal=False, w
         # Helper to pad to next multiple
         def pad_to_multiple(x, multiple, axis):
             seq_len = x.shape[axis]
-            if seq_len <= multiple:
+            if seq_len < multiple:
               return x, seq_len
             pad_len = (multiple - seq_len % multiple) % multiple
             if pad_len == 0:
@@ -341,7 +325,9 @@ def _tpu_splash_attention(query, key, value, env, scale=None, is_causal=False, w
             block_sizes = splash_attention.BlockSizes(
                 block_q=min(BQSIZE, padded_q_seq_len), block_kv=min(BKVSIZE, padded_kv_seq_len)
             )
+            print('===== block ====')
             print(block_sizes)
+            print('===== block ====')
             splash_kernel = splash_attention.make_splash_mha(
                 mask=mask, block_sizes=block_sizes, head_shards=1, q_seq_shards=1
             )
@@ -397,7 +383,7 @@ def scaled_dot_product_attention(
   # <--- MODIFIED: Disable splash attention for VAE --->
   # VAE typically has different attention patterns, disable splash attention for it
   # Check if this is likely VAE attention by looking at the shape
-  if query.shape[-1] >= 385:  # VAE typically has larger hidden dimensions (384)
+  if query.shape[-1] >= 384:  # VAE typically has larger hidden dimensions (384)
     #print(f"[DEBUG] Using reference implementation (VAE detected)")
     # Use reference implementation for VAE
     return _sdpa_reference(query, key, value, attn_mask, dropout_p, is_causal,
@@ -415,191 +401,15 @@ def scaled_dot_product_attention(
                          scale, enable_gqa)
 
 ###
-
-# Custom WanPipeline class to handle JAX VAE
-class JaxWanPipeline:
-    def __init__(self, original_pipeline, jax_vae, vae_cache):
-        self.original_pipeline = original_pipeline
-        self.jax_vae = jax_vae
-        self.vae_cache = vae_cache
-        self.scheduler = original_pipeline.scheduler
-        self.text_encoder = original_pipeline.text_encoder
-        self.transformer = original_pipeline.transformer
-        
-    def __call__(self, prompt, negative_prompt, height, width, num_inference_steps, num_frames, guidance_scale, output_type="pil"):
-        # Use original pipeline for everything except VAE
-        result = self.original_pipeline(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            num_frames=num_frames,
-            guidance_scale=guidance_scale,
-            output_type="latent"  # Force latent output to use our JAX VAE
-        )
-        
-        if output_type == "latent":
-            return result
-        
-        # Decode latents using JAX VAE
-        latents = result.latents
-        # Convert torch tensor to jax array
-        latents_jax = jnp.array(latents.detach().cpu().numpy())
-        
-        # Decode using JAX VAE
-        decoded = self.jax_vae.decode(latents_jax, feat_cache=self.vae_cache)
-        video = decoded.sample
-        
-        # Convert back to torch tensor and format
-        video_torch = torch.from_numpy(np.array(video)).to(latents.device)
-        video_torch = video_torch.permute(0, 4, 1, 2, 3)  # (B, C, T, H, W)
-        
-        # Create result object similar to original pipeline
-        class Result:
-            def __init__(self, frames):
-                self.frames = frames
-        
-        return Result([video_torch])
-
-# Fix for torch2jax compatibility issue
-def load_wan_vae_fixed(pretrained_model_name_or_path: str, eval_shapes: dict, device: str, hf_download: bool = True):
-    """Fixed version of load_wan_vae that avoids torch2jax issues"""
-    import torch
-    from huggingface_hub import hf_hub_download
-    from safetensors import safe_open
-    from flax.traverse_util import unflatten_dict, flatten_dict
-    
-    device_obj = jax.devices(device)[0]
-    with jax.default_device(device_obj):
-        if hf_download:
-            ckpt_path = hf_hub_download(
-                pretrained_model_name_or_path, subfolder="vae", filename="diffusion_pytorch_model.safetensors"
-            )
-        print(f"Load and port Wan 2.1 VAE on {device}")
-
-        if ckpt_path is not None:
-            tensors = {}
-            
-            # Use safetensors with numpy framework to avoid torchax interference
-            with safe_open(ckpt_path, framework="np") as f:
-                for k in f.keys():
-                    # Get numpy array directly
-                    numpy_tensor = f.get_tensor(k)
-                    tensors[k] = jnp.array(numpy_tensor)
-            
-            flax_state_dict = {}
-            cpu = jax.local_devices(backend="cpu")[0]
-            
-            # Import the utility functions
-            from maxdiffusion.models.modeling_flax_pytorch_utils import rename_key, rename_key_and_reshape_tensor, validate_flax_state_dict
-            
-            for pt_key, tensor in tensors.items():
-                renamed_pt_key = rename_key(pt_key)
-                # Order matters
-                renamed_pt_key = renamed_pt_key.replace("up_blocks_", "up_blocks.")
-                renamed_pt_key = renamed_pt_key.replace("mid_block_", "mid_block.")
-                renamed_pt_key = renamed_pt_key.replace("down_blocks_", "down_blocks.")
-
-                renamed_pt_key = renamed_pt_key.replace("conv_in.bias", "conv_in.conv.bias")
-                renamed_pt_key = renamed_pt_key.replace("conv_in.weight", "conv_in.conv.weight")
-                renamed_pt_key = renamed_pt_key.replace("conv_out.bias", "conv_out.conv.bias")
-                renamed_pt_key = renamed_pt_key.replace("conv_out.weight", "conv_out.conv.weight")
-                renamed_pt_key = renamed_pt_key.replace("attentions_", "attentions.")
-                renamed_pt_key = renamed_pt_key.replace("resnets_", "resnets.")
-                renamed_pt_key = renamed_pt_key.replace("upsamplers_", "upsamplers.")
-                renamed_pt_key = renamed_pt_key.replace("resample_", "resample.")
-                renamed_pt_key = renamed_pt_key.replace("conv1.bias", "conv1.conv.bias")
-                renamed_pt_key = renamed_pt_key.replace("conv1.weight", "conv1.conv.weight")
-                renamed_pt_key = renamed_pt_key.replace("conv2.bias", "conv2.conv.bias")
-                renamed_pt_key = renamed_pt_key.replace("conv2.weight", "conv2.conv.weight")
-                renamed_pt_key = renamed_pt_key.replace("time_conv.bias", "time_conv.conv.bias")
-                renamed_pt_key = renamed_pt_key.replace("time_conv.weight", "time_conv.conv.weight")
-                renamed_pt_key = renamed_pt_key.replace("quant_conv", "quant_conv.conv")
-                renamed_pt_key = renamed_pt_key.replace("conv_shortcut", "conv_shortcut.conv")
-                if "decoder" in renamed_pt_key:
-                    renamed_pt_key = renamed_pt_key.replace("resample.1.bias", "resample.layers.1.bias")
-                    renamed_pt_key = renamed_pt_key.replace("resample.1.weight", "resample.layers.1.weight")
-                if "encoder" in renamed_pt_key:
-                    renamed_pt_key = renamed_pt_key.replace("resample.1", "resample.conv")
-                pt_tuple_key = tuple(renamed_pt_key.split("."))
-                flax_key, flax_tensor = rename_key_and_reshape_tensor(pt_tuple_key, tensor, eval_shapes)
-                flax_key = tuple(int(item) if isinstance(item, str) and item.isdigit() else item for item in flax_key)
-                flax_state_dict[flax_key] = jax.device_put(jnp.asarray(flax_tensor), device=cpu)
-            
-            validate_flax_state_dict(eval_shapes, flax_state_dict)
-            flax_state_dict = unflatten_dict(flax_state_dict)
-            del tensors
-            jax.clear_caches()
-        else:
-            raise FileNotFoundError(f"Path {ckpt_path} was not found")
-
-        return flax_state_dict
-
-# --- Config Wrapper ---
-class ConfigWrapper:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-    def __getitem__(self, key):
-        return getattr(self, key)
-    def __setitem__(self, key, value):
-        setattr(self, key, value)
-
-class VAEProxy:
-
-    def __init__(self, vae, vae_cache, dtype, config):
-        self._vae = vae
-        self.vae_cache = vae_cache
-        self.dtype = dtype
-        self.config = config
-
-    def __getattr__(self, name):
-        return getattr(self._vae, name)
-
-    def decode(self, *args, **kwargs):
-        if 'feat_cache' not in kwargs:
-            kwargs['feat_cache'] = self.vae_cache
-        out = interop.call_jax(self._vae.decode, *args, **kwargs)
-        return out
-
-def prepare_video_for_export(video):
-    import torch
-    import numpy as np
-    if isinstance(video, (list, tuple)):
-        print("output 是 list/tuple，长度：", len(video))
-        return [prepare_video_for_export(v) for v in video]
-    if isinstance(video, torch.Tensor):
-        print("原始 shape:", video.shape)
-        if video.dim() == 5:  # (B, C, T, H, W)
-            video = video[0]
-        if video.dim() == 4:  # (C, T, H, W)
-            video = video.permute(1, 0, 2, 3)
-        # (T, C, H, W) -> (T, H, W, C)
-        video = video.permute(0, 2, 3, 1)
-        print("转置后 shape:", video.shape)
-        if video.shape[-1] > 3:
-            video = video[..., :3]
-        if video.shape[-1] not in [1, 2, 3, 4]:
-            video = torch.unsqueeze(video, -1)
-        print("裁剪/补齐后 shape:", video.shape)
-        video = video.cpu().numpy()
-        video = np.clip(video, 0, 255).astype(np.uint8)
-        print("最终 numpy shape:", video.shape)
-        # 如果是灰度，自动扩展为 3 通道
-        if video.shape[-1] == 1:
-            video = np.repeat(video, 3, axis=-1)
-        # 检查每一帧的 channel
-        for i, frame in enumerate(video):
-            if frame.shape[-1] not in [1, 2, 3, 4]:
-                print(f"第{i}帧 shape: {frame.shape}")
-        return video
-    if isinstance(video, np.ndarray):
-        print("numpy shape:", video.shape)
-        if video.shape[-1] == 1:
-            video = np.repeat(video, 3, axis=-1)
-        return video
-    print("未知类型：", type(video))
-    return video
+def _shard_weight_fsdp(weight_dict, mesh):
+  result = {}
+  for k, v in weight_dict.items():
+    if len(v.shape) == 2:
+      v.apply_jax_(jax.device_put, NamedSharding(mesh, P('axis')))
+    else:
+      v.apply_jax_(jax.device_put, NamedSharding(mesh, P()))
+    result[k] = v
+  return result
 
 def main():
   # Set JAX config to enable compilation cache
@@ -613,74 +423,12 @@ def main():
   #model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
   # model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
   model_id = MODEL_ID
-  
-  # Initialize JAX environment first
-  torchax.enable_globally()
-  env = torchax.default_env()
-  # Create a 2D mesh for FSDP sharding
-  mesh = jax.make_mesh((len(jax.devices()), 1), (axis, 'fsdp'))
-  env.default_device_or_sharding = NamedSharding(mesh, P())
-  env._mesh = mesh
-  env.config.use_tpu_splash_attention = True
-
-  # Initialize JAX VAE
-  key = jax.random.key(0)
-  rngs = nnx.Rngs(key)
-  
-  # Create JAX VAE with default parameters
-  wan_vae = AutoencoderKLWan(
-      rngs=rngs,
-      base_dim=96,
-      z_dim=16,
-      dim_mult=[1, 2, 4, 4],
-      num_res_blocks=2,
-      attn_scales=[],
-      temperal_downsample=[False, True, True],
-      mesh=mesh
-  )
-  
-  # Create VAE cache
-  vae_cache = AutoencoderKLWanCache(wan_vae)
-  
-  # Load pretrained weights
-  graphdef, state = nnx.split(wan_vae)
-  params = state.to_pure_dict()
-  params = load_wan_vae_fixed(model_id, params, "tpu")
-  # 保证全部 replicate 到 mesh 上所有 device
-  sharding = NamedSharding(mesh, P())
-  params = jax.tree_util.tree_map(lambda x: jax.device_put(x, sharding), params)
-  params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)
-  wan_vae = nnx.merge(graphdef, params)
-  
-  # Skip PyTorch VAE loading to avoid torchax interference
-  # We'll use JAX VAE directly
-  
-  # Temporarily disable torchax to load pipeline components
-  with torchax.disable_temporarily(): 
-    # flow_shift = 5.0 # 5.0 for 720P, 3.0 for 480P
-    flow_shift = FLOW_SHIFT
-    scheduler = UniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
-    
-    # Load pipeline without VAE to avoid torchax interference
-    pipe = WanPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16, use_safetensors=True)
-    pipe.scheduler = scheduler
-  
-  # Replace the VAE in the pipeline with our JAX VAE
-  vae_config = ConfigWrapper(
-      latents_mean=np.array(wan_vae.latents_mean),
-      latents_std=np.array(wan_vae.latents_std),
-      z_dim=wan_vae.z_dim
-  )
-  pipe.vae = VAEProxy(wan_vae, vae_cache, torch.bfloat16, vae_config)
-  pipe.vae_cache = vae_cache
-
-  # 伪装 config
-  vae_config = ConfigWrapper(
-      latents_mean=np.array(wan_vae.latents_mean),
-      latents_std=np.array(wan_vae.latents_std),
-      z_dim=wan_vae.z_dim
-  )
-  pipe.vae.config = vae_config
+  vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.bfloat16)
+  # flow_shift = 5.0 # 5.0 for 720P, 3.0 for 480P
+  flow_shift = FLOW_SHIFT
+  scheduler = UniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
+  pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16)
+  pipe.scheduler = scheduler
 
   # print('vae=====')
   # _print_weights(pipe.vae)
@@ -696,13 +444,13 @@ def main():
       state_dict = env.to_xla(state_dict)
       module.load_state_dict(state_dict, assign=True)
 
-  # Re-enable torchax for the rest of the pipeline
-  # torchax.enable_globally()  # Already enabled above
-  # env = torchax.default_env()  # Already initialized above
-  # mesh = jax.make_mesh((len(jax.devices()), 1), (axis, 'fsdp'))  # Already created above
-  # env.default_device_or_sharding = NamedSharding(mesh, P())  # Already set above
-  # env._mesh = mesh  # Already set above
-  # env.config.use_tpu_splash_attention = True  # Already set above
+  torchax.enable_globally()
+  env = torchax.default_env()
+  mesh = jax.make_mesh((len(jax.devices()),), (axis,))
+  env.default_device_or_sharding = NamedSharding(mesh, P())
+
+  env._mesh = mesh
+  env.config.use_tpu_splash_attention = True
 
   # <--- MODIFIED: Override flash attention with custom function, now with window_size --->
   custom_attention = functools.partial(
@@ -723,38 +471,35 @@ def main():
         is_view_op=False,
     )
 
-  # Compile modules with torchax (skip VAE as it's already JAX)
+
   vae_options = torchax.CompileOptions(
     methods_to_compile=['decode']
   )
-  # Skip VAE compilation as it's already JAX
-  # _move_module(pipe.vae)
-  # pipe.vae = torchax.compile(pipe.vae)
-  
+  _move_module(pipe.vae)
+  pipe.vae = torchax.compile(pipe.vae)
   _move_module(pipe.text_encoder)
   pipe.text_encoder = torchax.compile(pipe.text_encoder)
 
+  quantize.quantize_model(pipe.transformer.blocks)
+  print('Quantization done')
 
-  #pipe.transformer = quantize.quantize_model(pipe.transformer)
   # the param below is not declared as param or buffer so the module.to('jax') didnt work
   _move_module(pipe.transformer)
   pipe.transformer.rope.freqs = pipe.transformer.rope.freqs.to('jax')
   options = torchax.CompileOptions(
       jax_jit_kwargs={'static_argnames': ('return_dict',)}
   )
-
-  
   pipe.transformer = torchax.compile(pipe.transformer, options)
 
   #pipe.to('jax')
   print('Number of devices is:, ', len(jax.devices()))
 
-  #pipe.transformer.params = _shard_weight_dict(pipe.transformer.params, 
+  
+  pipe.transformer.params = {k: v.data if isinstance(v, torch.nn.Parameter) else v 
+                             for k, v in pipe.transformer.params.items()}
   pipe.transformer.params = _shard_weight_fsdp(pipe.transformer.params, 
-                                               transformer_shardings,
                                                mesh)
   pipe.transformer.buffers = _shard_weight_fsdp(pipe.transformer.buffers, 
-                                               transformer_shardings,
                                                mesh)
   pipe.text_encoder.params = _shard_weight_dict(pipe.text_encoder.params, 
                                                text_encoder_shardings,
@@ -763,9 +508,9 @@ def main():
                                                text_encoder_shardings,
                                                mesh)
 
-  # Skip VAE sharding as it's already JAX and handled differently
-  # pipe.vae.params = _shard_weight_dict(pipe.vae.params, {}, mesh)
-  # pipe.vae.buffers = _shard_weight_dict(pipe.vae.buffers, {}, mesh)
+  # NOTE this will effectively replicate vae
+  pipe.vae.params = _shard_weight_dict(pipe.vae.params, {}, mesh)
+  pipe.vae.buffers = _shard_weight_dict(pipe.vae.buffers, {}, mesh)
 
   def move_scheduler(scheduler):
     for k, v in scheduler.__dict__.items():
@@ -784,80 +529,37 @@ def main():
       module = getattr(pipe, m, None)
       if isinstance(module, torch.nn.Module):
           print(m, module_size(module) / (1024 * 1024 * 1024), 'G')
-      elif m == 'vae' and hasattr(pipe, 'vae_cache'):
-          # JAX VAE size calculation
-          print(f"{m} (JAX VAE) - size calculation not implemented")
 
 
   prompt = "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window."
   # prompt = "Drone view of waves crashing against the rugged cliffs along Big Sur's garay point beach.The crashing blue waters create white-tipped waves,while the golden light of the setting sun illuminates the rocky shore. A small island with a lighthouse sits in the distance, and greenshrubbery covers the cliffs edge. The steep drop from the road down to the beach is adramatic feat, with the cliff's edges jutting out over the sea. This is a view that captures the raw beauty of the coast and the rugged landscape of the Pacific Coast Highway."
   negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
+  replicate = NamedSharding(mesh, P())
 
-  with mesh:
-    # warm up and save video
-    output = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        height=HEIGHT,
-        width=WIDTH,
-        num_inference_steps=NUM_STEP,
-        num_frames=FRAMES,
-        guidance_scale=5.0,
-    ).frames[0]
-    #print("output type:", type(output))
-    #if hasattr(output, 'shape'):
-    #    print("output shape:", output.shape)
-    #elif isinstance(output, (list, tuple)):
-    #    for i, v in enumerate(output):
-    #        print(f"output[{i}] type: {type(v)}, shape: {getattr(v, 'shape', None)}")
-    output = prepare_video_for_export(output)
-    # 自动转置，确保 (T, H, W, C)
-    if isinstance(output, np.ndarray) and output.shape[-1] == FRAMES:
-        output = np.transpose(output, (3, 0, 1, 2))
-    current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"{current_datetime}.mp4"
-    export_to_video(output, file_name, fps=FPS)
-    print(f"output video done. {file_name}")
-    
-    # profile set fewer step and output latent to skip VAE for now
-    # output_type='latent' will skip VAE
-    options = jax.profiler.ProfileOptions()
-    options.advanced_configuration = {"tpu_trace_mode" : "TRACE_COMPUTE_AND_SYNC"}
+  def make_input():
+    return (torch.randn((1, 16, 21, 90, 160), device='jax').apply_jax(jax.device_put, replicate), 
+            torch.tensor([1], device='jax').apply_jax(jax.device_put, replicate), 
+            torch.randn((1, 512, 4096), device='jax').apply_jax(jax.device_put, replicate))
 
-    jax.profiler.start_trace(PROFILE_OUT_PATH, create_perfetto_link=False, profiler_options=options)
-    output = pipe(
-       prompt=prompt,
-       negative_prompt=negative_prompt,
-       height=HEIGHT,
-       width=WIDTH,
-       num_inference_steps=2,
-       num_frames=FRAMES,
-       guidance_scale=5.0,
-       output_type="latent",
-    )
-    jax.effects_barrier()
-    jax.profiler.stop_trace()
-    #print("profile done")
-    
-    # Benchmark loop
-    for i in range(1):
-      start = time.perf_counter()
-      output = pipe(
-          prompt=prompt,
-          negative_prompt=negative_prompt,
-          height=HEIGHT,
-          width=WIDTH,
-          num_inference_steps=NUM_STEP,
-          num_frames=FRAMES,
-          guidance_scale=5.0,
-      )
-      # make sure all computation done
-      jax.effects_barrier()
-      end = time.perf_counter()  
-      print(f'Iteration {i}: {end - start:.6f}s')
+  with mesh, torch.no_grad():
+      for i in range(5):
+        if i == 4:
+          jax.profiler.start_trace(PROFILE_OUT_PATH)
+        inputs = make_input()
+        jax.block_until_ready(inputs[0].jax())
+        start = time.perf_counter()
+        res = pipe.transformer(*inputs, None, return_dict=False, attention_kwargs=None)
+        res[0].jax().block_until_ready()
+        end = time.perf_counter()
+        if i == 4:
+          jax.profiler.stop_trace()
+        print(f'Iteration {i}: {end - start:.6f}s')
         
   print('DONE')
+
+  #print(f'生成视频时长= {(num_frams-1)/fps} - 目前针对1.3B生成5s = (41-1)/8)
+
 
 if __name__ == '__main__':
   main()
