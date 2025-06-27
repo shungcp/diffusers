@@ -11,11 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import jax
 from typing import Any, Dict, List, Optional, Tuple
+from torch.nn.utils import stateless as torch_stateless
+
 
 import torch
+import torchax
+from torchax import interop
+from jax.experimental import shard_map
 import torch.nn.functional as F
 from torch import nn
+from jax.sharding import PartitionSpec as P
 
 from ..utils import deprecate, logging
 from ..utils.torch_utils import maybe_allow_in_graph
@@ -1242,10 +1249,27 @@ class FeedForward(nn.Module):
         if final_dropout:
             self.net.append(nn.Dropout(dropout))
 
+    def _forward_single(self, weight, hidden_states):
+        weight = jax.lax.all_gather(weight, 'axis', axis=0, tiled=True)
+        tweight = interop.torch_view(weight)
+        with torch_stateless._reparametrize_module(self, tweight):
+            for module in self.net:
+                hidden_states = module(interop.torch_view(hidden_states))
+            return hidden_states.jax()
+
+
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
             deprecate("scale", "1.0.0", deprecation_message)
-        for module in self.net:
-            hidden_states = module(hidden_states)
-        return hidden_states
+
+        env = torchax.default_env()
+
+        res = shard_map.shard_map(
+            self._forward_single,
+            mesh=env._mesh,
+            in_specs=(P('axis',), P()),
+            out_specs=P(),
+            check_rep=False,
+        )(interop.jax_view(self.state_dict()), hidden_states.jax())
+        return interop.torch_view(res)

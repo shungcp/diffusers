@@ -8,10 +8,12 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+import quantize
 
 from jax.experimental.pallas.ops.tpu import splash_attention
 from jax.experimental.shard_map import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
+from torchax import interop
 
 # Add JAX VAE imports
 from flax import nnx
@@ -62,8 +64,9 @@ FPS = 16
 NUM_STEP = 50
 # NUM_STEP = 1
 
-BQSIZE = 16 * 9 * 25
-BKVSIZE = 1024
+BQSIZE =  2520 # 2240 # 3024 #2520
+BKVSIZE = 1024 # 2048 # 2304 # 1664 #2048
+
 
 # <--- NEW: Local Attention Window Size Setting --->
 # window_size = (left, right). (128, 0) means each token can attend to itself and the previous 128 tokens.
@@ -78,52 +81,65 @@ PROFILE_OUT_PATH = "/tmp/tensorboard"
 
 axis = 'axis'
 
-# Sharding for tranformers, all the replicated are commented out for speed
 transformer_shardings = {
 # 'scale_shift_table': (), # (torch.Size([1, 2, 1536]), torch.float32)
 # 'patch_embedding.weight': (), # (torch.Size([1536, 16, 1, 2, 2]), torch.bfloat16)
 # 'patch_embedding.bias': (), # (torch.Size([1536]), torch.bfloat16)
 r'condition_embedder.time_embedder.linear_1.weight': (axis, None), # (torch.Size([1536, 256]), torch.float32)
+r'condition_embedder.time_embedder.linear_1.weight_scaler': (axis, ), # (torch.Size([1536, 256]), torch.float32)
 r'condition_embedder.time_embedder.linear_1.bias': (axis,), # (torch.Size([1536]), torch.float32)
 r'condition_embedder.time_embedder.linear_2.weight': (None, axis), # (torch.Size([1536, 1536]), torch.float32)
+r'condition_embedder.time_embedder.linear_2.weight_scaler': (None, ), # (torch.Size([1536, 1536]), torch.float32)
 # 'condition_embedder.time_embedder.linear_2.bias': (), # (torch.Size([1536]), torch.float32)
 # 'condition_embedder.time_proj.weight': (), # (torch.Size([9216, 1536]), torch.bfloat16)
 # 'condition_embedder.time_proj.bias': (), # (torch.Size([9216]), torch.bfloat16)
 r'condition_embedder.text_embedder.linear_1.weight': (axis, None), # (torch.Size([1536, 4096]), torch.bfloat16)
+r'condition_embedder.text_embedder.linear_1.weight_scaler': (axis, ), # (torch.Size([1536, 4096]), torch.bfloat16)
 r'condition_embedder.text_embedder.linear_1.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'condition_embedder.text_embedder.linear_2.weight': (None, axis), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'condition_embedder.text_embedder.linear_2.weight_scaler': (None, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 # 'condition_embedder.text_embedder.linear_2.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.scale_shift_table': (), # (torch.Size([1, 6, 1536]), torch.float32)
 # 'blocks.\d+.attn1.norm_q.weight': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.attn1.norm_k.weight': (), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_q.weight': (axis, None), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn1.to_q.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_q.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_k.weight': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn1.to_k.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_k.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_v.weight': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn1.to_v.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_v.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 # to_out has 2 submodules, the first is the Linear and second is dropout
 r'blocks.\d+.attn1.to_out.0.weight': (None, axis), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn1.to_out.0.weight_scaler': (None, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 # 'blocks.\d+.attn1.to_out.0.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.attn1.to_out.1.weight': (), # (torch.Size([1536, 1536]), torch.bfloat16)
 # 'blocks.\d+.attn1.to_out.1.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.attn2.norm_q.weight': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.attn2.norm_k.weight': (), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_q.weight': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn2.to_q.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_q.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_k.weight': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn2.to_k.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_k.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_v.weight': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn2.to_v.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_v.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_out.0.weight': (None, axis), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn2.to_out.0.weight_scaler': (None, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 # 'blocks.\d+.attn2.to_out.0.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.attn2.to_out.1.weight': (), # (torch.Size([1536, 1536]), torch.bfloat16)
 # 'blocks.\d+.attn2.to_out.1.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.norm2.weight': (), # (torch.Size([1536]), torch.float32)
 # 'blocks.\d+.norm2.bias': (), # (torch.Size([1536]), torch.float32)
 r'blocks.\d+.ffn.net.0.proj.weight': (axis,), # (torch.Size([8960, 1536]), torch.bfloat16)
+r'blocks.\d+.ffn.net.0.proj.weight_scaler': (axis,), # (torch.Size([8960, 1536]), torch.bfloat16)
 r'blocks.\d+.ffn.net.0.proj.bias': (axis, ), # (torch.Size([8960]), torch.bfloat16)
 r'blocks.\d+.ffn.net.2.weight': (None, axis), # (torch.Size([1536, 8960]), torch.bfloat16)
+r'blocks.\d+.ffn.net.2.weight_scaler': (None, ), # (torch.Size([1536, 8960]), torch.bfloat16)
 # 'blocks.\d+.ffn.net.2.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'proj_out.weight': (), # (torch.Size([64, 1536]), torch.bfloat16)
 # 'proj_out.bias': (), # (torch.Size([64]), torch.bfloat16)
@@ -157,6 +173,18 @@ def _shard_weight_dict(weight_dict, sharding_dict, mesh):
 
     result[k] = v
   return result
+
+  
+def _shard_weight_fsdp(weight_dict, mesh):
+  result = {}
+  for k, v in weight_dict.items():
+    if len(v.shape) >= 2:
+      v.apply_jax_(jax.device_put, NamedSharding(mesh, P('axis')))
+    else:
+      v.apply_jax_(jax.device_put, NamedSharding(mesh, P()))
+    result[k] = v
+  return result
+
 
 
 def flatten_model_output(obj):
@@ -517,37 +545,22 @@ class ConfigWrapper:
     def __setitem__(self, key, value):
         setattr(self, key, value)
 
-def to_torch_recursive(x):
-    import torch
-    import numpy as np
-    if 'ArrayImpl' in str(type(x)):
-        return torch.from_numpy(np.array(x))
-    elif isinstance(x, (list, tuple)):
-        return type(x)(to_torch_recursive(xx) for xx in x)
-    elif isinstance(x, dict):
-        return {k: to_torch_recursive(v) for k, v in x.items()}
-    elif hasattr(x, 'sample'):
-        sample = to_torch_recursive(x.sample)
-        if hasattr(x, 'replace'):
-            return x.replace(sample=sample)
-        else:
-            return sample
-    else:
-        return x
-
 class VAEProxy:
+
     def __init__(self, vae, vae_cache, dtype, config):
         self._vae = vae
         self.vae_cache = vae_cache
         self.dtype = dtype
         self.config = config
+
     def __getattr__(self, name):
         return getattr(self._vae, name)
+
     def decode(self, *args, **kwargs):
         if 'feat_cache' not in kwargs:
             kwargs['feat_cache'] = self.vae_cache
-        out = self._vae.decode(*args, **kwargs)
-        return to_torch_recursive(out)
+        out = interop.call_jax(self._vae.decode, *args, **kwargs)
+        return out
 
 def prepare_video_for_export(video):
     import torch
@@ -643,9 +656,7 @@ def main():
   # We'll use JAX VAE directly
   
   # Temporarily disable torchax to load pipeline components
-  torchax.disable_globally()
-  
-  try:
+  with torchax.disable_temporarily(): 
     # flow_shift = 5.0 # 5.0 for 720P, 3.0 for 480P
     flow_shift = FLOW_SHIFT
     scheduler = UniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
@@ -653,9 +664,6 @@ def main():
     # Load pipeline without VAE to avoid torchax interference
     pipe = WanPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16, use_safetensors=True)
     pipe.scheduler = scheduler
-  finally:
-    # Re-enable torchax for the rest of the pipeline
-    torchax.enable_globally()
   
   # Replace the VAE in the pipeline with our JAX VAE
   vae_config = ConfigWrapper(
@@ -726,21 +734,26 @@ def main():
   _move_module(pipe.text_encoder)
   pipe.text_encoder = torchax.compile(pipe.text_encoder)
 
+
+  pipe.transformer = quantize.quantize_model(pipe.transformer)
   # the param below is not declared as param or buffer so the module.to('jax') didnt work
   _move_module(pipe.transformer)
   pipe.transformer.rope.freqs = pipe.transformer.rope.freqs.to('jax')
   options = torchax.CompileOptions(
       jax_jit_kwargs={'static_argnames': ('return_dict',)}
   )
+
+  
   pipe.transformer = torchax.compile(pipe.transformer, options)
 
   #pipe.to('jax')
   print('Number of devices is:, ', len(jax.devices()))
 
-  pipe.transformer.params = _shard_weight_dict(pipe.transformer.params, 
+  #pipe.transformer.params = _shard_weight_dict(pipe.transformer.params, 
+  pipe.transformer.params = _shard_weight_fsdp(pipe.transformer.params, 
                                                transformer_shardings,
                                                mesh)
-  pipe.transformer.buffers = _shard_weight_dict(pipe.transformer.buffers, 
+  pipe.transformer.buffers = _shard_weight_fsdp(pipe.transformer.buffers, 
                                                transformer_shardings,
                                                mesh)
   pipe.text_encoder.params = _shard_weight_dict(pipe.text_encoder.params, 
@@ -809,19 +822,22 @@ def main():
     
     # profile set fewer step and output latent to skip VAE for now
     # output_type='latent' will skip VAE
-    #jax.profiler.start_trace(PROFILE_OUT_PATH)
-    #output = pipe(
-    #    prompt=prompt,
-    #    negative_prompt=negative_prompt,
-    #    height=HEIGHT,
-    #    width=WIDTH,
-    #    num_inference_steps=2,
-    #    num_frames=FRAMES,
-    #    guidance_scale=5.0,
-    #    output_type="latent",
-    #)
-    #jax.effects_barrier()
-    #jax.profiler.stop_trace()
+    options = jax.profiler.ProfileOptions()
+    options.advanced_configuration = {"tpu_trace_mode" : "TRACE_COMPUTE_AND_SYNC"}
+
+    jax.profiler.start_trace(PROFILE_OUT_PATH, create_perfetto_link=False, profiler_options=options)
+    output = pipe(
+       prompt=prompt,
+       negative_prompt=negative_prompt,
+       height=HEIGHT,
+       width=WIDTH,
+       num_inference_steps=2,
+       num_frames=FRAMES,
+       guidance_scale=5.0,
+       output_type="latent",
+    )
+    jax.effects_barrier()
+    jax.profiler.stop_trace()
     #print("profile done")
     
     # Benchmark loop

@@ -1,3 +1,4 @@
+import quantize
 import functools
 import re
 import math
@@ -56,8 +57,8 @@ FPS = 16
 NUM_STEP = 50
 # NUM_STEP = 1
 
-BQSIZE = 16 * 9 * 25
-BKVSIZE = 1024
+BQSIZE =  2520 # 2240 # 3024 #2520
+BKVSIZE = 1024 # 2048 # 2304 # 1664 #2048
 
 # <--- NEW: Local Attention Window Size Setting --->
 # window_size = (left, right). (128, 0) means each token can attend to itself and the previous 128 tokens.
@@ -78,46 +79,60 @@ transformer_shardings = {
 # 'patch_embedding.weight': (), # (torch.Size([1536, 16, 1, 2, 2]), torch.bfloat16)
 # 'patch_embedding.bias': (), # (torch.Size([1536]), torch.bfloat16)
 r'condition_embedder.time_embedder.linear_1.weight': (axis, None), # (torch.Size([1536, 256]), torch.float32)
+r'condition_embedder.time_embedder.linear_1.weight_scaler': (axis, ), # (torch.Size([1536, 256]), torch.float32)
 r'condition_embedder.time_embedder.linear_1.bias': (axis,), # (torch.Size([1536]), torch.float32)
 r'condition_embedder.time_embedder.linear_2.weight': (None, axis), # (torch.Size([1536, 1536]), torch.float32)
+r'condition_embedder.time_embedder.linear_2.weight_scaler': (None, ), # (torch.Size([1536, 1536]), torch.float32)
 # 'condition_embedder.time_embedder.linear_2.bias': (), # (torch.Size([1536]), torch.float32)
 # 'condition_embedder.time_proj.weight': (), # (torch.Size([9216, 1536]), torch.bfloat16)
 # 'condition_embedder.time_proj.bias': (), # (torch.Size([9216]), torch.bfloat16)
 r'condition_embedder.text_embedder.linear_1.weight': (axis, None), # (torch.Size([1536, 4096]), torch.bfloat16)
+r'condition_embedder.text_embedder.linear_1.weight_scaler': (axis, ), # (torch.Size([1536, 4096]), torch.bfloat16)
 r'condition_embedder.text_embedder.linear_1.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'condition_embedder.text_embedder.linear_2.weight': (None, axis), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'condition_embedder.text_embedder.linear_2.weight_scaler': (None, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 # 'condition_embedder.text_embedder.linear_2.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.scale_shift_table': (), # (torch.Size([1, 6, 1536]), torch.float32)
 # 'blocks.\d+.attn1.norm_q.weight': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.attn1.norm_k.weight': (), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_q.weight': (axis, None), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn1.to_q.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_q.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_k.weight': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn1.to_k.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_k.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_v.weight': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn1.to_v.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn1.to_v.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 # to_out has 2 submodules, the first is the Linear and second is dropout
 r'blocks.\d+.attn1.to_out.0.weight': (None, axis), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn1.to_out.0.weight_scaler': (None, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 # 'blocks.\d+.attn1.to_out.0.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.attn1.to_out.1.weight': (), # (torch.Size([1536, 1536]), torch.bfloat16)
 # 'blocks.\d+.attn1.to_out.1.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.attn2.norm_q.weight': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.attn2.norm_k.weight': (), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_q.weight': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn2.to_q.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_q.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_k.weight': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn2.to_k.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_k.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_v.weight': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn2.to_v.weight_scaler': (axis, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_v.bias': (axis, ), # (torch.Size([1536]), torch.bfloat16)
 r'blocks.\d+.attn2.to_out.0.weight': (None, axis), # (torch.Size([1536, 1536]), torch.bfloat16)
+r'blocks.\d+.attn2.to_out.0.weight_scaler': (None, ), # (torch.Size([1536, 1536]), torch.bfloat16)
 # 'blocks.\d+.attn2.to_out.0.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.attn2.to_out.1.weight': (), # (torch.Size([1536, 1536]), torch.bfloat16)
 # 'blocks.\d+.attn2.to_out.1.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'blocks.\d+.norm2.weight': (), # (torch.Size([1536]), torch.float32)
 # 'blocks.\d+.norm2.bias': (), # (torch.Size([1536]), torch.float32)
 r'blocks.\d+.ffn.net.0.proj.weight': (axis,), # (torch.Size([8960, 1536]), torch.bfloat16)
+r'blocks.\d+.ffn.net.0.proj.weight_scaler': (axis,), # (torch.Size([8960, 1536]), torch.bfloat16)
 r'blocks.\d+.ffn.net.0.proj.bias': (axis, ), # (torch.Size([8960]), torch.bfloat16)
 r'blocks.\d+.ffn.net.2.weight': (None, axis), # (torch.Size([1536, 8960]), torch.bfloat16)
+r'blocks.\d+.ffn.net.2.weight_scaler': (None, ), # (torch.Size([1536, 8960]), torch.bfloat16)
 # 'blocks.\d+.ffn.net.2.bias': (), # (torch.Size([1536]), torch.bfloat16)
 # 'proj_out.weight': (), # (torch.Size([64, 1536]), torch.bfloat16)
 # 'proj_out.bias': (), # (torch.Size([64]), torch.bfloat16)
@@ -244,6 +259,9 @@ CF_FOR_ALL_REDUCE_AND_ALL_GATHER = (
     " --xla_tpu_enable_async_collective_fusion=true"
     " --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true"
     " --xla_tpu_enable_async_collective_fusion_multiple_steps=true"
+    " --xla_tpu_enable_async_collective_fusion_fuse_all_reduce=true"
+    " --xla_tpu_decompose_all_gather_einsum=true"
+    " --xla_tpu_decompose_einsum_reduce_scatter=true"
 )
 import os
 os.environ['LIBTPU_INIT_ARGS'] = CF_FOR_ALL_REDUCE_AND_ALL_GATHER
@@ -383,6 +401,15 @@ def scaled_dot_product_attention(
                          scale, enable_gqa)
 
 ###
+def _shard_weight_fsdp(weight_dict, mesh):
+  result = {}
+  for k, v in weight_dict.items():
+    if len(v.shape) == 2:
+      v.apply_jax_(jax.device_put, NamedSharding(mesh, P('axis')))
+    else:
+      v.apply_jax_(jax.device_put, NamedSharding(mesh, P()))
+    result[k] = v
+  return result
 
 def main():
   # Set JAX config to enable compilation cache
@@ -453,6 +480,9 @@ def main():
   _move_module(pipe.text_encoder)
   pipe.text_encoder = torchax.compile(pipe.text_encoder)
 
+  quantize.quantize_model(pipe.transformer.blocks)
+  print('Quantization done')
+
   # the param below is not declared as param or buffer so the module.to('jax') didnt work
   _move_module(pipe.transformer)
   pipe.transformer.rope.freqs = pipe.transformer.rope.freqs.to('jax')
@@ -465,12 +495,11 @@ def main():
   print('Number of devices is:, ', len(jax.devices()))
 
   
-
-  pipe.transformer.params = _shard_weight_dict(pipe.transformer.params, 
-                                               transformer_shardings,
+  pipe.transformer.params = {k: v.data if isinstance(v, torch.nn.Parameter) else v 
+                             for k, v in pipe.transformer.params.items()}
+  pipe.transformer.params = _shard_weight_fsdp(pipe.transformer.params, 
                                                mesh)
-  pipe.transformer.buffers = _shard_weight_dict(pipe.transformer.buffers, 
-                                               transformer_shardings,
+  pipe.transformer.buffers = _shard_weight_fsdp(pipe.transformer.buffers, 
                                                mesh)
   pipe.text_encoder.params = _shard_weight_dict(pipe.text_encoder.params, 
                                                text_encoder_shardings,
@@ -513,14 +542,18 @@ def main():
             torch.tensor([1], device='jax').apply_jax(jax.device_put, replicate), 
             torch.randn((1, 512, 4096), device='jax').apply_jax(jax.device_put, replicate))
 
-  with mesh:
+  with mesh, torch.no_grad():
       for i in range(5):
+        if i == 4:
+          jax.profiler.start_trace(PROFILE_OUT_PATH)
         inputs = make_input()
         jax.block_until_ready(inputs[0].jax())
         start = time.perf_counter()
         res = pipe.transformer(*inputs, None, return_dict=False, attention_kwargs=None)
         res[0].jax().block_until_ready()
         end = time.perf_counter()
+        if i == 4:
+          jax.profiler.stop_trace()
         print(f'Iteration {i}: {end - start:.6f}s')
         
   print('DONE')
