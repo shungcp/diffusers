@@ -75,7 +75,7 @@ BKVSIZE = 1024
 # Set to None to use the original full Causal Attention.
 WINDOW_SIZE = None
 
-PROFILE_OUT_PATH = "/tmp/tensorboard"
+PROFILE_OUT_PATH = "/dev/shm/tensorboard"
 
 USE_DP = True
 SP_NUM = 2
@@ -312,7 +312,15 @@ def _tpu_splash_attention(query, key, value, env, scale=None, is_causal=False, w
             splash_kernel = splash_attention.make_splash_mha(
                 mask=mask, block_sizes=block_sizes, head_shards=1, q_seq_shards=1
             )
-            out = splash_kernel(q_3d_padded, k_3d_padded, v_3d_padded)
+
+            q_padding_needed = q_3d_padded.shape[1] - q_3d.shape[1]
+            q_segment_ids = jnp.ones((q_seq_len,), dtype=jnp.int32)
+            q_segment_ids = jnp.pad(q_segment_ids, ((0, q_padding_needed),))
+            kv_padding_needed = k_3d_padded.shape[1] - k_3d.shape[1]
+            kv_segment_ids = jnp.ones((kv_seq_len,), dtype=jnp.int32)
+            kv_segment_ids = jnp.pad(kv_segment_ids, ((0, kv_padding_needed),))
+            segment_ids = splash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
+            out = splash_kernel(q_3d_padded, k_3d_padded, v_3d_padded, segment_ids=segment_ids)
             # Remove padding if any
             return out[:, :q_orig_len, ...]
 
@@ -816,24 +824,25 @@ def main():
     export_to_video(output, file_name, fps=args.fps)
     print(f"output video done. {file_name}")
     
-    # profile set fewer step and output latent to skip VAE for now
-    # output_type='latent' will skip VAE
-    #jax.profiler.start_trace(PROFILE_OUT_PATH)
-    #output = pipe(
-    #    prompt=prompt,
-    #    negative_prompt=negative_prompt,
-    #    height=HEIGHT,
-    #    width=WIDTH,
-    #    num_inference_steps=2,
-    #    num_frames=FRAMES,
-    #    guidance_scale=5.0,
-    #    output_type="latent",
-    #    generator=generator,
-    #    use_dp=USE_DP,
-    #)
-    #jax.effects_barrier()
-    #jax.profiler.stop_trace()
-    #print("profile done")
+    if args.profile:
+      # profile set fewer step and output latent to skip VAE for now
+      # output_type='latent' will skip VAE
+      jax.profiler.start_trace(PROFILE_OUT_PATH)
+      output = pipe(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        height=args.height,
+        width=args.width,
+        num_inference_steps=3,
+        num_frames=args.frames,
+        guidance_scale=5.0,
+        output_type="latent",
+        generator=generator,
+        use_dp=args.use_dp,
+      )
+      jax.effects_barrier()
+      jax.profiler.stop_trace()
+      print("profile done")
     
     # Benchmark loop
     for i in range(1):
@@ -861,6 +870,7 @@ def parse_args():
     parser.add_argument("--t5_cpu", action="store_true", default=False, help="Offload T5 text_encoder to CPU")
     parser.add_argument("--bqsize", type=int, default=1512, help="Block Q size")
     parser.add_argument("--bkvsize", type=int, default=256, help="Block KV size")
+    parser.add_argument("--profile", action="store_true", default=False, help="Add profiler")
     return parser.parse_args()
 
 if __name__ == '__main__':
