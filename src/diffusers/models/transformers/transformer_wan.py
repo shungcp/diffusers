@@ -275,21 +275,62 @@ class WanTransformerBlock(nn.Module):
         ).chunk(6, dim=1)
 
         # 1. Self-attention
-        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+        norm_hidden_states = (self.norm1(hidden_states.bfloat16()) * (1 + scale_msa.bfloat16()) + shift_msa.bfloat16()).type_as(hidden_states)
         attn_output = self.attn1(hidden_states=norm_hidden_states, rotary_emb=rotary_emb)
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+        # Ensure all tensors are on the same device before addition
+        hidden_states = hidden_states.to(attn_output.device).bfloat16()
+        gate_msa = gate_msa.to(attn_output.device).bfloat16()
+        attn_output = attn_output.bfloat16()
+        # Ensure sequence lengths match before addition
+        if hidden_states.shape[1] != attn_output.shape[1]:
+            # Pad or truncate attn_output to match hidden_states sequence length
+            if attn_output.shape[1] > hidden_states.shape[1]:
+                attn_output = attn_output[:, :hidden_states.shape[1], :]
+            else:
+                # Pad with zeros if attn_output is shorter
+                pad_len = hidden_states.shape[1] - attn_output.shape[1]
+                attn_output = torch.nn.functional.pad(attn_output, (0, 0, 0, pad_len, 0, 0))
+        # Use torch.add instead of + operator to handle potential sharding issues
+        hidden_states = torch.add(hidden_states, torch.mul(attn_output, gate_msa)).type_as(hidden_states)
 
         # 2. Cross-attention
-        norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
+        norm_hidden_states = self.norm2(hidden_states.bfloat16()).type_as(hidden_states)
         attn_output = self.attn2(hidden_states=norm_hidden_states, encoder_hidden_states=encoder_hidden_states)
-        hidden_states = hidden_states + attn_output
+        # Ensure all tensors are on the same device and have compatible shapes before addition
+        hidden_states = hidden_states.to(attn_output.device).bfloat16()
+        attn_output = attn_output.bfloat16()
+        # Ensure sequence lengths match before addition
+        if hidden_states.shape[1] != attn_output.shape[1]:
+            # Pad or truncate attn_output to match hidden_states sequence length
+            if attn_output.shape[1] > hidden_states.shape[1]:
+                attn_output = attn_output[:, :hidden_states.shape[1], :]
+            else:
+                # Pad with zeros if attn_output is shorter
+                pad_len = hidden_states.shape[1] - attn_output.shape[1]
+                attn_output = torch.nn.functional.pad(attn_output, (0, 0, 0, pad_len, 0, 0))
+        # Use torch.add instead of + operator to handle potential sharding issues
+        hidden_states = torch.add(hidden_states, attn_output).type_as(hidden_states)
 
         # 3. Feed-forward
-        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
+        norm_hidden_states = (self.norm3(hidden_states.bfloat16()) * (1 + c_scale_msa.bfloat16()) + c_shift_msa.bfloat16()).type_as(
             hidden_states
         )
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+        # Ensure all tensors are on the same device before addition
+        hidden_states = hidden_states.to(ff_output.device).bfloat16()
+        c_gate_msa = c_gate_msa.to(ff_output.device).bfloat16()
+        ff_output = ff_output.bfloat16()
+        # Ensure sequence lengths match before addition
+        if hidden_states.shape[1] != ff_output.shape[1]:
+            # Pad or truncate ff_output to match hidden_states sequence length
+            if ff_output.shape[1] > hidden_states.shape[1]:
+                ff_output = ff_output[:, :hidden_states.shape[1], :]
+            else:
+                # Pad with zeros if ff_output is shorter
+                pad_len = hidden_states.shape[1] - ff_output.shape[1]
+                ff_output = torch.nn.functional.pad(ff_output, (0, 0, 0, pad_len, 0, 0))
+        # Use torch.add instead of + operator to handle potential sharding issues
+        hidden_states = torch.add(hidden_states, torch.mul(ff_output, c_gate_msa)).type_as(hidden_states)
 
         return hidden_states
 

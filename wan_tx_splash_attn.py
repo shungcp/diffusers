@@ -47,6 +47,11 @@ import traceback
 import types
 import argparse
 
+from tpu_sageattention import TPUSageAttention, create_tpu_sageattention
+from aqt.jax import aqt_dot_general, aqt_tensor
+from aqt_attention.aqt_splash_attention_kernel import make_aqt_splash_attention, get_default_aqt_config, AqtBlockSizes
+from aqt_attention.aqt_splash_attention_kernel import get_attention_optimized_aqt_config
+
 #### SETTINGS
 # 1.3B
 # MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
@@ -66,8 +71,8 @@ FPS = 16
 NUM_STEP = 50
 # NUM_STEP = 1
 
-BQSIZE =  1512 # 2240 # 3024 #2520
-BKVSIZE = 1024
+BQSIZE =  1024 # 2240 # 3024 #2520
+BKVSIZE = 1024 # 2304 # 1664 #2048
 
 # <--- NEW: Local Attention Window Size Setting --->
 # window_size = (left, right). (128, 0) means each token can attend to itself and the previous 128 tokens.
@@ -87,7 +92,6 @@ LOGICAL_AXIS_RULES = (
                   )
 
 ####
-
 
 axis = 'axis'
 
@@ -257,21 +261,17 @@ def _sdpa_reference(
   return attn_weight @ value
 
 
-# <--- MODIFIED: Added window_size parameter to the function signature --->
 def _tpu_splash_attention(query, key, value, env, scale=None, is_causal=False, window_size=None):
     import jax
     import math
     mesh = env._mesh
     num_heads = query.shape[1]
-
     # The function that will be sharded across devices.
     def _attention_on_slices(q, k, v):
         import jax.numpy as jnp
         # Scale the query tensor. This happens on each device with its slice of data.
         scale_factor = 1.0 / math.sqrt(q.shape[-1]) if scale is None else scale
         q = q * scale_factor
-
-        # Helper to pad to next multiple
         def pad_to_multiple(x, multiple, axis):
             seq_len = x.shape[axis]
             pad_len = (multiple - seq_len % multiple) % multiple
@@ -280,32 +280,22 @@ def _tpu_splash_attention(query, key, value, env, scale=None, is_causal=False, w
             pad_width = [(0, 0)] * x.ndim
             pad_width[axis] = (0, pad_len)
             return jnp.pad(x, pad_width), seq_len
-
-        # This function operates on a single item from the batch.
         def kernel_3d(q_3d, k_3d, v_3d):
             q_seq_len = q_3d.shape[1]
             kv_seq_len = k_3d.shape[1]
             num_heads_on_device = q_3d.shape[0]
-
-            # Pad q, k, v to next multiple of BQSIZE/BKVSIZE
             q_3d_padded, q_orig_len = pad_to_multiple(q_3d, BQSIZE, axis=1)
             k_3d_padded, k_orig_len = pad_to_multiple(k_3d, BKVSIZE, axis=1)
             v_3d_padded, v_orig_len = pad_to_multiple(v_3d, BKVSIZE, axis=1)
-
             padded_q_seq_len = q_3d_padded.shape[1]
             padded_kv_seq_len = k_3d_padded.shape[1]
-
-            # ======================= NEW MASK LOGIC =======================
             if window_size is not None:
                 mask_class = functools.partial(splash_attention.LocalMask, window_size=window_size, offset=0)
             else:
                 mask_class = splash_attention.FullMask
-
             mask = splash_attention.MultiHeadMask(
                 [mask_class((padded_q_seq_len, padded_kv_seq_len)) for _ in range(num_heads_on_device)]
             )
-            # =============================================================
-
             block_sizes = splash_attention.BlockSizes(
                 block_q=min(BQSIZE, padded_q_seq_len), block_kv=min(BKVSIZE, padded_kv_seq_len)
             )
@@ -313,20 +303,13 @@ def _tpu_splash_attention(query, key, value, env, scale=None, is_causal=False, w
                 mask=mask, block_sizes=block_sizes, head_shards=1, q_seq_shards=1
             )
             out = splash_kernel(q_3d_padded, k_3d_padded, v_3d_padded)
-            # Remove padding if any
             return out[:, :q_orig_len, ...]
-
-        # Map the kernel over the batch dimension.
         vmapped_kernel = jax.vmap(kernel_3d, in_axes=(0, 0, 0), out_axes=0)
         return vmapped_kernel(q, k, v)
-
-    # Determine the partitioning spec based on the number of heads.
     if num_heads < mesh.size:
-        # Replicated case for VAE. All devices get the full tensor.
         q_partition_spec = P()
         kv_partition_spec = P()
     else:
-        # Sharded case for Transformer. Split along the heads axis.
         # Attn1 self attention, key length is long.
         if key.shape[2] > 10000:
           q_partition_spec = P('dp', 'axis', 'sp', None)
@@ -335,8 +318,6 @@ def _tpu_splash_attention(query, key, value, env, scale=None, is_causal=False, w
           # Attn2 which is cross attention, kv sequence is shorter. All gather the key value cost less.
           q_partition_spec = P('dp', None, ('axis', 'sp'), None)
           kv_partition_spec = P('dp', None, None, None)
-
-    # ALWAYS use shard_map. The partition_spec will control the behavior.
     sharded_fn = shard_map(
         _attention_on_slices,
         mesh=mesh,
@@ -349,7 +330,143 @@ def _tpu_splash_attention(query, key, value, env, scale=None, is_causal=False, w
     return out
 
 
-# <--- MODIFIED: Added window_size parameter to the function signature --->
+def _tpu_sageattention(query, key, value, env, scale=None, is_causal=False, window_size=None):
+    import jax
+    import jax.numpy as jnp
+    from tpu_sageattention import TPUSageAttention, create_tpu_sageattention
+    mesh = env._mesh
+    num_heads = query.shape[1]
+    head_dim = query.shape[-1]
+    sage_attn = create_tpu_sageattention(head_dim=head_dim, use_tpu=True)
+    def _attention_on_slices(q, k, v):
+        return sage_attn.forward(q, k, v, is_causal=is_causal, sm_scale=scale)
+    if num_heads < mesh.size:
+        q_partition_spec = P()
+        kv_partition_spec = P()
+    else:
+        q_partition_spec = P('dp', 'axis', 'sp', None)
+        kv_partition_spec = P('dp', 'axis', None, None)
+    sharded_fn = shard_map(
+        _attention_on_slices,
+        mesh=mesh,
+        in_specs=(q_partition_spec, kv_partition_spec, kv_partition_spec),
+        out_specs=q_partition_spec,
+        check_rep=False,
+    )
+    res = sharded_fn(query, key, value)
+    out = env.j2t_iso(res)
+    print("type after j2t_iso:", type(out))
+    return out
+
+
+def pad_to_block(x, block_size, axis=2):
+    """Pad tensor x on axis to the next multiple of block_size."""
+    seq_len = x.shape[axis]
+    pad_len = (block_size - seq_len % block_size) % block_size
+    if pad_len == 0:
+        return x
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[axis] = (0, pad_len)
+    return jnp.pad(x, pad_width)
+
+def _tpu_aqt_attention(query, key, value, env, scale=None, is_causal=False, window_size=None):
+    """
+    重构后的AQT Splash Attention调用函数 (v1.2)
+    """
+    import jax
+    import math
+    from aqt_attention import splash_attention_mask as mask_lib # 确保导入
+
+    mesh = env._mesh
+    num_heads, q_seq_len, head_dim = query.shape[1], query.shape[2], query.shape[3]
+    kv_seq_len = key.shape[2]
+
+    # 1. 统一应用 scale_factor
+    scale_factor = 1.0 / math.sqrt(head_dim) if scale is None else scale
+    query = query * scale_factor
+    
+    # 2. 【核心修正】直接创建正确的Mask对象
+    # Pallas内核处理padding，所以我们使用padded的长度
+    padded_q_seq_len = query.shape[2]
+    padded_kv_seq_len = key.shape[2]
+    
+    if is_causal and window_size is None:
+        # 纯因果场景
+        mask_obj_per_head = mask_lib.CausalMask((padded_q_seq_len, padded_kv_seq_len))
+    elif window_size is not None:
+        # 局部注意力场景 (可以是因果的，也可以不是)
+        # 假设 LocalMask 总是因果的，offset=0
+        mask_obj_per_head = mask_lib.LocalMask(shape=(padded_q_seq_len, padded_kv_seq_len), window_size=window_size, offset=0)
+    else:
+        # 全注意力场景 (非因果)
+        mask_obj_per_head = mask_lib.FullMask((padded_q_seq_len, padded_kv_seq_len))
+        
+    # 将单个mask对象包装成多头mask
+    mask = mask_lib.MultiHeadMask([mask_obj_per_head for _ in range(num_heads)])
+
+    # 3. 定义将在 shard_map 中执行的函数
+    def _attention_on_slices(q, k, v):
+        # q, k, v 是已经分片到各个设备上的张量
+        
+        # 获取分片后的头数
+        num_heads_on_device = q.shape[1] 
+        
+        # 根据设备上的头数，调整mask
+        sharded_mask = mask_lib.MultiHeadMask(mask.masks[:num_heads_on_device])
+        
+        # 一次性创建内核
+        block_sizes = AqtBlockSizes(
+            block_q=BQSIZE,
+            block_kv=BKVSIZE,
+            block_kv_compute=BKVSIZE
+        )
+        
+        aqt_kernel = make_aqt_splash_attention(
+            mask=sharded_mask,
+            q_config=get_attention_optimized_aqt_config(),
+            k_config=get_attention_optimized_aqt_config(),
+            block_sizes=block_sizes,
+            # head_shards 和 q_seq_shards 对于单设备内的调用是1
+            head_shards=1, 
+            q_seq_shards=1
+        )
+        
+        # 内核的输入期望是 (num_heads, seq_len, head_dim)
+        # shard_map传入的q,k,v已经是 (batch, num_heads_on_device, seq_len, head_dim)
+        # 我们需要去掉batch维度，因为它通常是1
+        if q.shape[0] != 1:
+            raise ValueError("AQT attention expects batch size of 1 for sharding.")
+            
+        q_no_batch = q.squeeze(0)
+        k_no_batch = k.squeeze(0)
+        v_no_batch = v.squeeze(0)
+        
+        # 调用内核
+        output_no_batch = aqt_kernel(q_no_batch, k_no_batch, v_no_batch)
+        
+        # 恢复batch维度
+        return jnp.expand_dims(output_no_batch, axis=0)
+
+    # 4. 设置分片规格并执行
+    if num_heads < mesh.size:
+        # 如果头数少于设备数，无法分片，只能复制
+        q_partition_spec = P()
+        kv_partition_spec = P()
+    else:
+        # 正常分片，将'head'维度(axis=1)映射到mesh的'axis'
+        q_partition_spec = P('dp', ('axis', 'sp'), None, None)
+        kv_partition_spec = P('dp', ('axis', 'sp'), None, None)
+    
+    sharded_fn = shard_map(
+        _attention_on_slices,
+        mesh=mesh,
+        in_specs=(q_partition_spec, kv_partition_spec, kv_partition_spec),
+        out_specs=q_partition_spec,
+        check_rep=False,
+    )
+    
+    return sharded_fn(query, key, value)
+
 def scaled_dot_product_attention(
     query,
     key,
@@ -360,27 +477,33 @@ def scaled_dot_product_attention(
     scale=None,
     enable_gqa=False,
     env=None,
-    window_size=None, # <--- NEW
+    window_size=None,
 ) -> torch.Tensor:
-  # Debug prints to understand what's happening
-  #print(f"[DEBUG] scaled_dot_product_attention called with:")
-  #print(f"  query.shape={query.shape}")
-  #print(f"  key.shape={key.shape}")
-  #print(f"  value.shape={value.shape}")
-  #print(f"  query.shape[-1]={query.shape[-1]}")
-  #print(f"  window_size={window_size}")
-  #print(f"  env.config.use_tpu_splash_attention={env.config.use_tpu_splash_attention if env else 'None'}")
+    global BQSIZE, BKVSIZE
+    backend = getattr(env.config, 'tpu_attention_backend', None)
+    if backend is None and hasattr(env.config, 'use_tpu_splash_attention'):
+        backend = 'splash' if env.config.use_tpu_splash_attention else None
+        env.config.tpu_attention_backend = backend
 
-  if env.config.use_tpu_splash_attention:
-    #print(f"[DEBUG] Using splash attention")
-    jquery, jkey, jvalue = env.t2j_iso((query, key, value))
-    # <--- MODIFIED: Pass window_size to the backend function --->
-    res = _tpu_splash_attention(jquery, jkey, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
-    return env.j2t_iso(res)
-
-  #print(f"[DEBUG] Using reference implementation (fallback)")
-  return _sdpa_reference(query, key, value, attn_mask, dropout_p, is_causal,
-                         scale, enable_gqa)
+    if backend == 'sage':
+        jquery, jkey, jvalue = env.t2j_iso((query, key, value))
+        jquery = pad_to_block(jquery, BQSIZE, axis=2)
+        jkey = pad_to_block(jkey, BKVSIZE, axis=2)
+        jvalue = pad_to_block(jvalue, BKVSIZE, axis=2)
+        res = _tpu_sageattention(jquery, jkey, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
+        return env.j2t_iso(res)
+    elif backend == 'splash':
+        jquery, jkey, jvalue = env.t2j_iso((query, key, value))
+        res = _tpu_splash_attention(jquery, jkey, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
+        return env.j2t_iso(res)
+    elif backend == 'aqt':
+        jquery, jkey, jvalue = env.t2j_iso((query, key, value))
+        jquery = pad_to_block(jquery, BQSIZE, axis=2)
+        jkey = pad_to_block(jkey, BKVSIZE, axis=2)
+        jvalue = pad_to_block(jvalue, BKVSIZE, axis=2)
+        res = _tpu_aqt_attention(jquery, jkey, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
+        return env.j2t_iso(res)
+    return _sdpa_reference(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
 
 ###
 
@@ -614,7 +737,8 @@ def main():
 
   env.default_device_or_sharding = NamedSharding(mesh, P())
   env._mesh = mesh
-  env.config.use_tpu_splash_attention = True
+  #env.config.use_tpu_splash_attention = True
+  env.config.tpu_attention_backend = args.tpu_attention_backend
 
   # Initialize JAX VAE
   key = jax.random.key(0)
@@ -871,6 +995,7 @@ def parse_args():
     parser.add_argument("--bqsize", type=int, default=BQSIZE, help="Block Q size")
     parser.add_argument("--bkvsize", type=int, default=BKVSIZE, help="Block KV size")
     parser.add_argument("--profile", action="store_true", default=False, help="Add profiler")
+    parser.add_argument("--tpu_attention_backend", type=str, choices=['splash', 'sage', 'aqt'], default='splash', help="TPU attention backend to use")
     return parser.parse_args()
 
 if __name__ == '__main__':
