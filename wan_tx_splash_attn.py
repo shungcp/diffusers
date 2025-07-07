@@ -501,7 +501,12 @@ def scaled_dot_product_attention(
         jquery = pad_to_block(jquery, BQSIZE, axis=2)
         jkey = pad_to_block(jkey, BKVSIZE, axis=2)
         jvalue = pad_to_block(jvalue, BKVSIZE, axis=2)
-        res = _tpu_aqt_attention(jquery, jkey, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
+
+        key_mean = jnp.mean(jkey, axis=2, keepdims=True)
+        jkey_smoothed = jkey - key_mean
+
+        #res = _tpu_aqt_attention(jquery, jkey, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
+        res = _tpu_aqt_attention(jquery, jkey_smoothed, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
         return env.j2t_iso(res)
     return _sdpa_reference(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
 

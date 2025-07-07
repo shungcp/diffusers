@@ -12,8 +12,6 @@ import dataclasses
 from aqt_attention import splash_attention_mask as mask_lib
 from aqt_attention import splash_attention_mask_info as mask_info_lib
 
-# AQT and other constants remain the same...
-# (此处省略了之前版本中的AQT导入、配置函数和常量定义，它们保持不变)
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
