@@ -12,6 +12,8 @@ import dataclasses
 from aqt_attention import splash_attention_mask as mask_lib
 from aqt_attention import splash_attention_mask_info as mask_info_lib
 
+# AQT and other constants remain the same...
+# (此处省略了之前版本中的AQT导入、配置函数和常量定义，它们保持不变)
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
@@ -43,7 +45,10 @@ def aqt_flash_attention_kernel(
     # AQT相关配置 (在当前实现中未使用，但保留接口)
     q_config: Any, k_config: Any,
     # 布局参数
-    q_layout: int, k_layout: int, v_layout: int
+    q_layout: int, k_layout: int, v_layout: int,
+    # 新增：静态scale参数
+    q_scale_val: float,
+    k_scale_val: float
 ):
     """
     在Pallas中集成了Tile-wise量化的Flash Attention内核最终版
@@ -60,6 +65,13 @@ def aqt_flash_attention_kernel(
         o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
         m_scratch_ref[...] = jnp.full_like(m_scratch_ref, -1e6) # 使用一个足够小的值
         l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+        # 初始化scale统计信息
+        # 暂时注释掉，用于调试
+        # if collect_scale_stats and scale_stats_ref is not None:
+        #     scale_stats_ref[0] = 0.0
+        #     scale_stats_ref[1] = 0.0
+        #     scale_stats_ref[2] = 0.0
+        #     scale_stats_ref[3] = 0.0
 
     global_kv_index, _, should_run, should_not_mask = _next_nonzero(
         h, i, j, data_next_ref, block_mask_ref, mask_next_ref
@@ -76,21 +88,17 @@ def aqt_flash_attention_kernel(
         else:
             k_tile_bf16 = k_ref[:, slice_k]
 
-        # 2. 计算每个tile的量化scale（对称量化）
-        # 修复：将bfloat16转换为float32以避免TPU限制
-        q_float32 = q_tile_bf16.astype(float32)
-        k_float32 = k_tile_bf16.astype(float32)
-        
-        q_max = jnp.max(jnp.abs(q_float32))
-        k_max = jnp.max(jnp.abs(k_float32))
-        q_scale = q_max / 127.0 + 1e-8
-        k_scale = k_max / 127.0 + 1e-8
+        # 【核心改动】直接使用传入的静态scale
+        q_scale = q_scale_val
+        k_scale = k_scale_val
 
         # 3. 量化到 int8
+        q_float32 = q_tile_bf16.astype(float32)
+        k_float32 = k_tile_bf16.astype(float32)
         q_quantized = jnp.round(q_float32 / q_scale).astype(jnp.int8)
         k_quantized = jnp.round(k_float32 / k_scale).astype(jnp.int8)
 
-        # 4. 【核心修正】执行 int8 矩阵乘法
+        # 4. int8 matmul
         qk_dims = NT_DIM_NUMBERS if k_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
         qk_int32 = lax.dot_general(
             q_quantized,
@@ -101,7 +109,6 @@ def aqt_flash_attention_kernel(
 
         # 5. 反量化回 float32
         qk = qk_int32.astype(jnp.float32) * (q_scale * k_scale)
-        
         assert qk.shape == (bq, bkv_compute)
 
         # 6. 应用 mask 和 softmax
@@ -131,7 +138,6 @@ def aqt_flash_attention_kernel(
             v = v_ref[slice_k, :]
         else:
             v = v_ref[:, slice_k]
-            
         sv_dims = NN_DIM_NUMBERS if v_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
         o_curr = lax.dot_general(s_curr, v, sv_dims, preferred_element_type=float32)
 
@@ -152,6 +158,17 @@ def aqt_flash_attention_kernel(
         o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
         if logsumexp_ref is not None:
             logsumexp_ref[...] = (jnp.log(l) + m_scratch_ref[...]).astype(logsumexp_ref.dtype)
+        
+        # 输出scale统计信息（用于收集静态scale值）
+        # 暂时注释掉，用于调试
+        # if collect_scale_stats and scale_stats_ref is not None:
+        #     # 简化版本：只输出当前block的scale值
+        #     # 这里我们假设scale_stats_ref包含了当前block的统计信息
+        #     # 在实际使用中，你可以在外部收集这些值并计算平均值
+        #     print(f"🔍 AQT Scale Stats - Head {h}, Block {i}: "
+        #           f"q_scale={scale_stats_ref[0]:.6f}, k_scale={scale_stats_ref[1]:.6f}, "
+        #           f"q_max={scale_stats_ref[2]:.6f}, k_max={scale_stats_ref[3]:.6f}")
+        
         m_scratch_ref[...] = jnp.zeros_like(m_scratch_ref)
         l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
         o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
@@ -318,6 +335,9 @@ class AqtSplashAttentionKernel:
         mask_value: float = DEFAULT_MASK_VALUE,
         attn_logits_soft_cap: float | None = None,
         interpret: bool = False,
+        collect_scale_stats: bool = False,
+        q_scale_val: float = 0.035925,
+        k_scale_val: float = 0.035925,
     ):
         self.fwd_mask_info = fwd_mask_info
         self.q_config = q_config
@@ -326,6 +346,9 @@ class AqtSplashAttentionKernel:
         self.mask_value = mask_value
         self.attn_logits_soft_cap = attn_logits_soft_cap
         self.interpret = interpret
+        self.collect_scale_stats = collect_scale_stats
+        self.q_scale_val = q_scale_val
+        self.k_scale_val = k_scale_val
     
     def __call__(self, q, k, v, segment_ids=None, save_residuals=False):
         """执行AQT Splash Attention"""
@@ -380,37 +403,32 @@ class AqtSplashAttentionKernel:
         # 使用与原始Splash Attention相同的index_map逻辑
         def k_index_map(h, i, j, data_next_ref, block_mask_ref, mask_next_ref=None):
             next_j, *_ = _next_nonzero(h, i, j, data_next_ref, block_mask_ref, mask_next_ref)
-            # 使用from_head_minor来正确处理布局，就像原始Splash Attention一样
-            # 对于非MQA，prefix = (h,)；对于MQA，prefix = ()
-            # 这里我们假设非MQA，因为用户确认需要多头支持
-            prefix = (h,)  # 非MQA情况
-            return from_head_minor((*prefix, next_j, 0), 0)  # 使用HEAD_DIM_MINOR布局
+            prefix = (h,)
+            return from_head_minor((*prefix, next_j, 0), 0)
         
         def v_index_map(h, i, j, data_next_ref, block_mask_ref, mask_next_ref=None):
             next_j, *_ = _next_nonzero(h, i, j, data_next_ref, block_mask_ref, mask_next_ref)
-            # 与k_index_map保持一致
-            prefix = (h,)  # 非MQA情况
-            return from_head_minor((*prefix, next_j, 0), 0)  # 使用HEAD_DIM_MINOR布局
+            prefix = (h,)
+            return from_head_minor((*prefix, next_j, 0), 0)
         
         def out_index_map(h, i, j, *_):
             return h, i, 0
         
-        # 设置输入输出specs - 与原始Splash Attention一致
         in_specs = [
-            pl.BlockSpec((None, bq, head_dim_qk), q_index_map),  # q - 使用None表示head维度
-            pl.BlockSpec((None, bkv, head_dim_qk), k_index_map),  # k - 使用None表示head维度
-            pl.BlockSpec((None, bkv, head_dim_v), v_index_map),   # v - 使用None表示head维度
-            None,  # q_segment_ids
-            None,  # kv_segment_ids
-            pl.BlockSpec((None, bq, bkv), lambda *_: (0, 0, 0)) if self.fwd_mask_info.partial_mask_blocks is not None else None,  # partial_mask_blocks
-            None,  # q_sequence
+            pl.BlockSpec((None, bq, head_dim_qk), q_index_map),
+            pl.BlockSpec((None, bkv, head_dim_qk), k_index_map),
+            pl.BlockSpec((None, bkv, head_dim_v), v_index_map),
+            None,
+            None,
+            pl.BlockSpec((None, bq, bkv), lambda *_: (0, 0, 0)) if self.fwd_mask_info.partial_mask_blocks is not None else None,
+            pl.BlockSpec((bq, NUM_LANES), lambda h, i, *_: (i, 0)) if self.fwd_mask_info.q_sequence is not None else None,
         ]
         
         out_shapes = [
-            jax.ShapeDtypeStruct((bq, NUM_LANES), jnp.float32),  # m_scratch
-            jax.ShapeDtypeStruct((bq, NUM_LANES), jnp.float32),  # l_scratch
-            jax.ShapeDtypeStruct((bq, head_dim_v), jnp.float32), # o_scratch
-            jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim_v), q.dtype),  # output
+            jax.ShapeDtypeStruct((bq, NUM_LANES), jnp.float32),
+            jax.ShapeDtypeStruct((bq, NUM_LANES), jnp.float32),
+            jax.ShapeDtypeStruct((bq, head_dim_v), jnp.float32),
+            jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim_v), q.dtype),
         ]
         
         out_specs = [
@@ -427,11 +445,9 @@ class AqtSplashAttentionKernel:
             out_shapes.append(None)
             out_specs.append(None)
         
-        # 调用Pallas kernel
         kernel_name = f"aqt_splash_attention_{bq}_{bkv}_{bkv_compute}"
         
         with jax.named_scope(kernel_name):
-            # 使用与原始Splash Attention相同的方式：总是传递mask参数
             all_out = pl.pallas_call(
                 functools.partial(
                     aqt_flash_attention_kernel,
@@ -448,9 +464,11 @@ class AqtSplashAttentionKernel:
                     q_layout=0,
                     k_layout=0,
                     v_layout=0,
+                    q_scale_val=self.q_scale_val,
+                    k_scale_val=self.k_scale_val
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
-                    num_scalar_prefetch=3,  # 总是3，与原始Splash Attention一致
+                    num_scalar_prefetch=3,
                     in_specs=in_specs,
                     out_specs=out_specs,
                     grid=grid,
@@ -465,13 +483,13 @@ class AqtSplashAttentionKernel:
                 self.fwd_mask_info.data_next,
                 self.fwd_mask_info.block_mask,
                 self.fwd_mask_info.mask_next,
-                q,  # 传递原始q，在kernel内部量化
-                k,  # 传递原始k，在kernel内部量化
+                q,
+                k,
                 v,
-                None,  # q_segment_ids
-                None,  # kv_segment_ids
+                None,
+                None,
                 self.fwd_mask_info.partial_mask_blocks,
-                self.fwd_mask_info.q_sequence,
+                jax.lax.broadcast_in_dim(self.fwd_mask_info.q_sequence, (q_seq_len, NUM_LANES), (0,)) if self.fwd_mask_info.q_sequence is not None else None,
             )
         
         _, _, _, out, logsumexp = all_out
@@ -492,6 +510,9 @@ def make_aqt_splash_attention(
     interpret: bool = False,
     head_shards: int = 1,
     q_seq_shards: int = 1,
+    collect_scale_stats: bool = False,
+    q_scale_val: float = 0.035925,
+    k_scale_val: float = 0.035925,
 ):
     """创建AQT Splash Attention kernel"""
     if q_config is None:
@@ -501,7 +522,6 @@ def make_aqt_splash_attention(
     
     # 处理mask - 添加分片支持
     if mask is None:
-        # 对于无mask的情况，使用None表示所有块都是可见的
         fwd_mask_info = mask_info_lib.MaskInfo(
             data_next=None,
             block_mask=None,
@@ -510,12 +530,9 @@ def make_aqt_splash_attention(
             q_sequence=None,
         )
     elif isinstance(mask, np.ndarray):
-        # 检查是否为因果mask（下三角矩阵）
         is_causal = _is_causal_mask(mask)
-        
         if is_causal:
-            # 对于因果mask，使用mask_function而不是静态mask
-            seq_len = mask.shape[1]  # 假设是方阵
+            seq_len = mask.shape[1]
             fwd_mask_info = mask_info_lib.MaskInfo(
                 data_next=None,
                 block_mask=None,
@@ -524,7 +541,6 @@ def make_aqt_splash_attention(
                 q_sequence=jnp.arange(seq_len, dtype=jnp.int32),
             )
         else:
-            # 对于其他类型的mask，使用process_mask处理分片
             if block_sizes is not None:
                 try:
                     fwd_mask_info, _ = mask_info_lib.process_mask(
@@ -535,7 +551,6 @@ def make_aqt_splash_attention(
                     )
                     fwd_mask_info = jax.tree_util.tree_map(jnp.array, fwd_mask_info)
                 except Exception as e:
-                    #print(f"process_mask failed, using default: {e}")
                     fwd_mask_info = mask_info_lib.MaskInfo(
                         data_next=None,
                         block_mask=None,
@@ -552,7 +567,6 @@ def make_aqt_splash_attention(
                     q_sequence=None,
                 )
     else:
-        # 其他类型的mask（如MultiHeadMask对象）
         if block_sizes is not None:
             try:
                 fwd_mask_info, _ = mask_info_lib.process_mask(
@@ -563,7 +577,6 @@ def make_aqt_splash_attention(
                 )
                 fwd_mask_info = jax.tree_util.tree_map(jnp.array, fwd_mask_info)
             except Exception as e:
-                #print(f"process_mask failed, using default: {e}")
                 fwd_mask_info = mask_info_lib.MaskInfo(
                     data_next=None,
                     block_mask=None,
@@ -584,16 +597,19 @@ def make_aqt_splash_attention(
         fwd_mask_info=fwd_mask_info,
         q_config=q_config,
         k_config=k_config,
-        block_sizes=block_sizes,  # 传递block_sizes以支持分片
+        block_sizes=block_sizes,
         mask_value=mask_value,
         attn_logits_soft_cap=attn_logits_soft_cap,
         interpret=interpret,
+        collect_scale_stats=collect_scale_stats,
+        q_scale_val=q_scale_val,
+        k_scale_val=k_scale_val,
     )
 
 # 兼容性函数
 def aqt_splash_attention_fn(mask, q, k, v, segment_ids=None, mask_value=DEFAULT_MASK_VALUE, 
                            save_residuals=False, attn_logits_soft_cap=None, 
-                           q_config=None, k_config=None, block_multiple=128):
+                           q_config=None, k_config=None, block_multiple=128, collect_scale_stats=False):
     """兼容性函数，使用新的AQT Splash Attention实现"""
     block_sizes = AqtBlockSizes(
         block_q=block_multiple,
@@ -608,6 +624,9 @@ def aqt_splash_attention_fn(mask, q, k, v, segment_ids=None, mask_value=DEFAULT_
         block_sizes=block_sizes,
         mask_value=mask_value,
         attn_logits_soft_cap=attn_logits_soft_cap,
+        collect_scale_stats=collect_scale_stats,
+        q_scale_val=0.035925,
+        k_scale_val=0.035925,
     )
     
     return kernel(q, k, v, segment_ids, save_residuals) 
@@ -622,3 +641,18 @@ def from_head_minor(vals: tuple[Any, ...], layout: int):
 def _div(dividend: int, divisor: int):
     """Integer division"""
     return dividend // divisor
+
+def _is_causal_mask(mask: np.ndarray) -> bool:
+    """检查是否为因果mask（下三角矩阵）"""
+    if mask.ndim != 2 or mask.shape[0] != mask.shape[1]:
+        return False
+    
+    # 检查是否为下三角矩阵（包括对角线）
+    seq_len = mask.shape[0]
+    for i in range(seq_len):
+        for j in range(seq_len):
+            if j > i and mask[i, j] != 0:  # 上三角部分应该都是0
+                return False
+            if j <= i and mask[i, j] == 0:  # 下三角部分应该都是1
+                return False
+    return True

@@ -428,7 +428,8 @@ def _tpu_aqt_attention(query, key, value, env, scale=None, is_causal=False, wind
             block_sizes=block_sizes,
             # head_shards 和 q_seq_shards 对于单设备内的调用是1
             head_shards=1, 
-            q_seq_shards=1
+            q_seq_shards=1,
+            collect_scale_stats=False  # 启用scale统计收集
         )
         
         # 内核的输入期望是 (num_heads, seq_len, head_dim)
@@ -1000,7 +1001,7 @@ def parse_args():
     parser.add_argument("--bqsize", type=int, default=BQSIZE, help="Block Q size")
     parser.add_argument("--bkvsize", type=int, default=BKVSIZE, help="Block KV size")
     parser.add_argument("--profile", action="store_true", default=False, help="Add profiler")
-    parser.add_argument("--tpu_attention_backend", type=str, choices=['splash', 'sage', 'aqt'], default='splash', help="TPU attention backend to use")
+    parser.add_argument("--tpu_attention_backend", type=str, choices=['splash', 'sage', 'aqt'], default='aqt', help="TPU attention backend to use")
     return parser.parse_args()
 
 if __name__ == '__main__':
