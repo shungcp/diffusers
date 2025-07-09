@@ -24,6 +24,7 @@ python wan_tx.py
 # Progress:
 
 (Jun 17)
+```
 ┏━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
 ┃ Device ┃ Memory usage         ┃ Duty cycle ┃
 ┡━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
@@ -35,6 +36,7 @@ python wan_tx.py
 │ 5      │ 2.08 GiB / 31.25 GiB │      0.00% │
 │ 6      │ 2.08 GiB / 31.25 GiB │      0.00% │
 │ 7      │ 2.08 GiB / 31.25 GiB │      0.00% │
+```
 
 
 ## sizes:
@@ -344,3 +346,18 @@ The optimal block size may change. Not sweep the block size yet.
   * python wan_tx_splash_attn.py --use_dp --sp_num=1 --bqsize 1512 --bkvsize 1024
   * 100%|██████████| 50/50 [02:55<00:00,  3.50s/it]
   * Iteration 0 BKVSIZE=1024, BQSIZE=1512: 184.074076s
+
+
+### v.2025-07-08 works for Int8 QK quantization (ideas from sage attention)
+
+* Int8 QK quantization, and V remain bf16
+* K-Smoothing for better video quality
+* (TODO) ops fusion for better performance
+* (TODO) int8 quantization refactor
+
+current flow is too complexed: abs(q) -> reduce_max(q) -> div -> abs(k) -> reduce_max(k) -> div -> round -> clip -> cast_to_int8 -> dot(q_int8, k_int8) -> cast_to_float32 -> mul, already use some experience values for k_scale_val and q_cale_val to save the latency, now around 400s.
+
+### v.2025-07-09 works for Ulysse Parallel (slow now >600s, no splash attention integrated, will do next step.)
+
+* ring attention following the Ulysses method
+

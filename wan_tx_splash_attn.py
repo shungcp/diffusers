@@ -8,12 +8,23 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+import flax.linen as nn
 
+from jax.experimental import pjit
+from jax.lax import ppermute, dot_general
 from jax.experimental.pallas.ops.tpu import splash_attention
 from jax.experimental.shard_map import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
+from jax import tree_util
+
+from aqt.jax.v2.pallas import quantizer as aqt_pallas_quantizer
+
+from aqt_attention import splash_attention_mask as mask_lib
+from aqt_attention import splash_attention_mask_info as mask_info_lib
+from aqt_attention.splash_attention_mask import MultiHeadMask, CausalMask, FullMask, LocalMask
+from aqt_attention.splash_attention_kernel import make_splash_mha, BlockSizes
 
 # Add JAX VAE imports
 from flax import nnx
@@ -31,9 +42,11 @@ from maxdiffusion.models.wan.autoencoder_kl_wan import (
 )
 from maxdiffusion.models.wan.wan_utils import load_wan_vae
 from flax.linen import partitioning as nn_partitioning
+from typing import Optional
 
 from diffusers.utils import export_to_video
 from diffusers import AutoencoderKLWan as TorchAutoencoderKLWan, WanPipeline
+from diffusers.models.transformers.transformer_wan import WanAttnProcessor2_0
 from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
 from jax.tree_util import register_pytree_node
@@ -48,9 +61,47 @@ import types
 import argparse
 
 from tpu_sageattention import TPUSageAttention, create_tpu_sageattention
-from aqt.jax import aqt_dot_general, aqt_tensor
-from aqt_attention.aqt_splash_attention_kernel import make_aqt_splash_attention, get_default_aqt_config, AqtBlockSizes
-from aqt_attention.aqt_splash_attention_kernel import get_attention_optimized_aqt_config
+
+
+def mask_flatten(mask):
+  """Flattens a Mask object into its dynamic children and static auxiliary data."""
+  # For Mask objects, all their attributes (like shape) are static. They have no dynamic children.
+  return (), (type(mask), mask.shape)
+
+def mask_unflatten(aux_data, children):
+  """Recreates a Mask object from its static auxiliary data and dynamic children."""
+  mask_type, shape = aux_data
+  return mask_type(shape)
+
+# Register the simple masks that only have a shape
+tree_util.register_pytree_node(CausalMask, mask_flatten, mask_unflatten)
+tree_util.register_pytree_node(FullMask, mask_flatten, mask_unflatten)
+
+def local_mask_flatten(mask):
+    """Flatten function for LocalMask, which has more attributes."""
+    return (), (type(mask), mask.shape, mask.window_size, mask.offset)
+
+def local_mask_unflatten(aux_data, children):
+    """Unflatten function for LocalMask."""
+    mask_type, shape, window_size, offset = aux_data
+    return mask_type(shape, window_size=window_size, offset=offset)
+
+tree_util.register_pytree_node(LocalMask, local_mask_flatten, local_mask_unflatten)
+
+
+def multi_head_mask_flatten(mhm):
+  """Flattens a MultiHeadMask. Its children are the individual masks."""
+  return (mhm.masks,), type(mhm)
+
+def multi_head_mask_unflatten(mhm_type, children):
+  """Recreates a MultiHeadMask from its children."""
+  # children is a tuple containing one element: the tuple of masks
+  return mhm_type(children[0])
+
+tree_util.register_pytree_node(MultiHeadMask, multi_head_mask_flatten, multi_head_mask_unflatten)
+
+print("Successfully registered custom Mask objects as JAX Pytrees.")
+# --- END: JAX Pytree Registration ---
 
 #### SETTINGS
 # 1.3B
@@ -160,6 +211,10 @@ text_encoder_shardings = {
   # 'encoder.final_layer_norm.weight': (), # (torch.Size([4096]), torch.bfloat16)
 }
 
+class QuantizationParams:
+    def __init__(self, scale, noise=None):
+        self.scale = scale
+        self.noise = noise
 
 def _shard_weight_dict(weight_dict, sharding_dict, mesh):
   result = {}
@@ -182,10 +237,19 @@ def flatten_model_output(obj):
 def unflatten_model_output(aux, children):
   return aux(*children)
 
-register_pytree_node(
-  modeling_outputs.BaseModelOutputWithPastAndCrossAttentions,
-  flatten_model_output,
-  unflatten_model_output)
+# ---- PyTree 注册保护 ----
+try:
+    from jax import tree_util
+    import transformers
+    tree_util.register_pytree_node(
+        transformers.modeling_outputs.BaseModelOutputWithPastAndCrossAttentions,
+        # 这里填写你原有的 to_iterable, from_iterable
+        lambda obj: (list(obj.__dict__.values()), None),
+        lambda _, values: transformers.modeling_outputs.BaseModelOutputWithPastAndCrossAttentions(*values)
+    )
+except (ValueError, ImportError) as e:
+    if 'Duplicate custom PyTreeDef type registration' not in str(e):
+        raise
 
 def make_key(name):
   return re.sub('\.\d+\.', '.*.', name)
@@ -221,7 +285,6 @@ def _print_weights(module):
   for k, v in result.items():
     print(f"'{k}': (), # {v}")
   print('}')
-
 
 ### Splash attention ###
 
@@ -364,152 +427,170 @@ def pad_to_block(x, block_size, axis=2):
     seq_len = x.shape[axis]
     pad_len = (block_size - seq_len % block_size) % block_size
     if pad_len == 0:
-        return x
+        return x, 0
     pad_width = [(0, 0)] * x.ndim
     pad_width[axis] = (0, pad_len)
-    return jnp.pad(x, pad_width)
+    x_padded = jnp.pad(x, pad_width)
+    return x_padded, pad_len
+
+def unpad(x, pad_len, axis=2):
+    if pad_len == 0:
+        return x
+    idx = [slice(None)] * x.ndim
+    idx[axis] = slice(0, -pad_len)
+    return x[tuple(idx)]
 
 def _tpu_aqt_attention(query, key, value, env, scale=None, is_causal=False, window_size=None):
     """
-    重构后的AQT Splash Attention调用函数 (v1.2)
+    最终版 AQT Splash Attention 实现 (v2.0)。
+    结合了 K-Smoothing 和 AQT官方Pallas量化内核。
     """
-    import jax
-    import math
-    from aqt_attention import splash_attention_mask as mask_lib # 确保导入
-
     mesh = env._mesh
-    num_heads, q_seq_len, head_dim = query.shape[1], query.shape[2], query.shape[3]
-    kv_seq_len = key.shape[2]
+    batch_size, num_heads, q_seq_len, head_dim = query.shape
 
-    # 1. 统一应用 scale_factor
+    if batch_size != 1:
+        raise ValueError(f"当前实现假设推理时的batch size为1，但得到了{batch_size}")
+
+    # 1. 预处理: scale_factor 和 K-Smoothing
     scale_factor = 1.0 / math.sqrt(head_dim) if scale is None else scale
     query = query * scale_factor
-    
-    # 2. 【核心修正】直接创建正确的Mask对象
-    # Pallas内核处理padding，所以我们使用padded的长度
-    padded_q_seq_len = query.shape[2]
-    padded_kv_seq_len = key.shape[2]
-    
-    if is_causal and window_size is None:
-        # 纯因果场景
-        mask_obj_per_head = mask_lib.CausalMask((padded_q_seq_len, padded_kv_seq_len))
-    elif window_size is not None:
-        # 局部注意力场景 (可以是因果的，也可以不是)
-        # 假设 LocalMask 总是因果的，offset=0
-        mask_obj_per_head = mask_lib.LocalMask(shape=(padded_q_seq_len, padded_kv_seq_len), window_size=window_size, offset=0)
-    else:
-        # 全注意力场景 (非因果)
-        mask_obj_per_head = mask_lib.FullMask((padded_q_seq_len, padded_kv_seq_len))
-        
-    # 将单个mask对象包装成多头mask
-    mask = mask_lib.MultiHeadMask([mask_obj_per_head for _ in range(num_heads)])
+    key_mean = jnp.mean(key, axis=2, keepdims=True)
+    key_smoothed = key - key_mean
 
-    # 3. 定义将在 shard_map 中执行的函数
-    def _attention_on_slices(q, k, v):
-        # q, k, v 是已经分片到各个设备上的张量
+    # 2. 【核心修正】使用AQT官方Pallas内核进行量化
+    # 定义量化目标类型
+    quant_dtype = quant_dtypes.int8
+    
+    # 【重要】定义静态Scale。您需要通过校准得到最优值。
+    # 这里的0.2是一个示例占位符，您可以根据之前收集的max值来设定一个合理的初始值。
+    STATIC_Q_SCALE = 0.2
+    STATIC_K_SCALE = 0.2
+
+    # 创建量化参数
+    q_quant_params = QuantizationParams(scale=jnp.full((), STATIC_Q_SCALE, dtype=jnp.float32), noise=None)
+    k_quant_params = QuantizationParams(scale=jnp.full((), STATIC_K_SCALE, dtype=jnp.float32), noise=None)
+
+    # 调用AQT官方提供的、高性能的Pallas量化内核
+    query_quantized = aqt_pallas_quantizer.quant(query, q_quant_params, dtype=quant_dtype)
+    key_quantized = aqt_pallas_quantizer.quant(key_smoothed, k_quant_params, dtype=quant_dtype)
+    
+    # 3. 准备并调用我们简化后的Attention内核
+    def _attention_on_slices(q_i8, k_i8, v, q_s, k_s):
+        q_no_batch, k_no_batch, v_no_batch = q_i8.squeeze(0), k_i8.squeeze(0), v.squeeze(0)
         
-        # 获取分片后的头数
-        num_heads_on_device = q.shape[1] 
+        # 准备mask
+        padded_q_seq_len, padded_kv_seq_len = q_no_batch.shape[1], k_no_batch.shape[1]
         
-        # 根据设备上的头数，调整mask
-        sharded_mask = mask_lib.MultiHeadMask(mask.masks[:num_heads_on_device])
+        if is_causal and window_size is None:
+            mask_class = mask_lib.CausalMask
+        elif window_size is not None:
+            mask_class = functools.partial(mask_lib.LocalMask, window_size=window_size, offset=0)
+        else:
+            mask_class = mask_lib.FullMask
+
+        mask_list = [mask_class((padded_q_seq_len, padded_kv_seq_len)) for _ in range(q_no_batch.shape[0])]
+        assert len(mask_list) > 0, f"mask_list is empty! q_no_batch.shape={q_no_batch.shape}"
+        assert all(hasattr(m, '__class__') and m.__class__.__name__.endswith('Mask') for m in mask_list), f"mask_list contains non-Mask: {mask_list}"
+        mask = mask_lib.MultiHeadMask(mask_list)
         
-        # 一次性创建内核
-        block_sizes = AqtBlockSizes(
-            block_q=BQSIZE,
-            block_kv=BKVSIZE,
-            block_kv_compute=BKVSIZE
+        # 使用mask_info_lib来处理mask以支持稀疏性
+        block_sizes_for_mask = (BQSIZE, BKVSIZE)
+        head_shards_for_mask = mesh.shape.get('axis', 1) * mesh.shape.get('sp', 1)
+        # process_mask前详细打印和断言
+        print("[DEBUG] process_mask前 mask type:", type(mask), "mask:", mask)
+        if hasattr(mask, 'masks'):
+            print("[DEBUG] mask.masks types:", [type(m) for m in mask.masks])
+        assert hasattr(mask, 'masks'), f"mask has no attribute 'masks', type={type(mask)}"
+        assert all(hasattr(m, '__class__') and m.__class__.__name__.endswith('Mask') for m in mask.masks), f"mask.masks contains non-Mask: {mask.masks}"
+        fwd_mask_info, mask_function = mask_info_lib.process_mask(
+            mask, block_sizes_for_mask, head_shards=head_shards_for_mask, q_seq_shards=1
         )
+        # process_mask后（如有返回mask相关对象）可继续打印
+        fwd_mask_info = jax.tree_util.tree_map(jnp.array, fwd_mask_info)
+
+        # 定义Pallas调用
+        grid_width = padded_kv_seq_len // BKVSIZE
+        grid = (q_no_batch.shape[0], padded_q_seq_len // BQSIZE, grid_width)
         
-        aqt_kernel = make_aqt_splash_attention(
-            mask=sharded_mask,
-            q_config=get_attention_optimized_aqt_config(),
-            k_config=get_attention_optimized_aqt_config(),
-            block_sizes=block_sizes,
-            # head_shards 和 q_seq_shards 对于单设备内的调用是1
-            head_shards=1, 
-            q_seq_shards=1,
-            collect_scale_stats=False  # 启用scale统计收集
-        )
+        out_shape = jax.ShapeDtypeStruct(v_no_batch.shape, v_no_batch.dtype)
+        # 完整的输出形状列表，包括scratch buffers
+        full_out_shapes = [
+            jax.ShapeDtypeStruct((BQSIZE, NUM_LANES), jnp.float32), # m_scratch
+            jax.ShapeDtypeStruct((BQSIZE, NUM_LANES), jnp.float32), # l_scratch
+            jax.ShapeDtypeStruct((BQSIZE, head_dim), jnp.float32), # o_scratch
+            out_shape, # 最终输出
+            None, # logsumexp
+        ]
         
-        # 内核的输入期望是 (num_heads, seq_len, head_dim)
-        # shard_map传入的q,k,v已经是 (batch, num_heads_on_device, seq_len, head_dim)
-        # 我们需要去掉batch维度，因为它通常是1
-        if q.shape[0] != 1:
-            raise ValueError("AQT attention expects batch size of 1 for sharding.")
-            
-        q_no_batch = q.squeeze(0)
-        k_no_batch = k.squeeze(0)
-        v_no_batch = v.squeeze(0)
+        # 调用我们自己简化后的内核
+        output_no_batch = pl.pallas_call(
+            functools.partial(aqt_flash_attention_kernel, 
+                              mask_value=DEFAULT_MASK_VALUE, grid_width=grid_width,
+                              bq=BQSIZE, bkv=BKVSIZE, bkv_compute=BKVSIZE, head_dim=head_dim,
+                              attn_logits_soft_cap=None, mask_function=mask_function),
+            out_shape=full_out_shapes,
+            grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=3),
+        )(
+            fwd_mask_info.data_next, fwd_mask_info.block_mask, fwd_mask_info.mask_next,
+            q_no_batch, k_no_batch, v_no_batch, # int8, int8, bf16
+            q_s, k_s, # scales
+            None, None, # segment_ids
+            fwd_mask_info.partial_mask_blocks, fwd_mask_info.q_sequence
+        )[3] # 只取最终的输出
         
-        # 调用内核
-        output_no_batch = aqt_kernel(q_no_batch, k_no_batch, v_no_batch)
-        
-        # 恢复batch维度
         return jnp.expand_dims(output_no_batch, axis=0)
 
-    # 4. 设置分片规格并执行
-    if num_heads < mesh.size:
-        # 如果头数少于设备数，无法分片，只能复制
-        q_partition_spec = P()
-        kv_partition_spec = P()
-    else:
-        # 正常分片，将'head'维度(axis=1)映射到mesh的'axis'
-        q_partition_spec = P('dp', ('axis', 'sp'), None, None)
-        kv_partition_spec = P('dp', ('axis', 'sp'), None, None)
+    # 4. 设置分片并执行
+    q_part = P('dp', ('axis', 'sp'), None, None)
+    kv_part = P('dp', ('axis', 'sp'), None, None)
+    scale_part = P() # scale是标量，复制到所有设备
     
     sharded_fn = shard_map(
         _attention_on_slices,
         mesh=mesh,
-        in_specs=(q_partition_spec, kv_partition_spec, kv_partition_spec),
-        out_specs=q_partition_spec,
+        in_specs=(q_part, kv_part, kv_part, scale_part, scale_part), # q_i8, k_i8, v_bf16, q_scale, k_scale
+        out_specs=q_part,
         check_rep=False,
     )
     
-    return sharded_fn(query, key, value)
+    return sharded_fn(query_quantized, key_quantized, value, q_quant_params.scale, k_quant_params.scale)
 
-def scaled_dot_product_attention(
-    query,
-    key,
-    value,
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False,
-    scale=None,
-    enable_gqa=False,
-    env=None,
-    window_size=None,
-) -> torch.Tensor:
-    global BQSIZE, BKVSIZE
-    backend = getattr(env.config, 'tpu_attention_backend', None)
-    if backend is None and hasattr(env.config, 'use_tpu_splash_attention'):
-        backend = 'splash' if env.config.use_tpu_splash_attention else None
-        env.config.tpu_attention_backend = backend
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, backend=None, env=None, **kwargs):
+    if env is None:
+        raise RuntimeError('env must be provided for ring/splash/aqt/sage attention!')
+    # 优先用参数 backend，其次用 env.config.tpu_attention_backend
+    if backend is not None:
+        selected_backend = backend
+    elif env is not None and hasattr(env, "config"):
+        selected_backend = getattr(env.config, "tpu_attention_backend", "splash")
+    else:
+        selected_backend = "ring"  # 或其它默认
 
-    if backend == 'sage':
+    if selected_backend == 'sage':
         jquery, jkey, jvalue = env.t2j_iso((query, key, value))
-        jquery = pad_to_block(jquery, BQSIZE, axis=2)
-        jkey = pad_to_block(jkey, BKVSIZE, axis=2)
-        jvalue = pad_to_block(jvalue, BKVSIZE, axis=2)
-        res = _tpu_sageattention(jquery, jkey, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
+        jquery = pad_to_block(jquery, BQSIZE, axis=2)[0]
+        jkey = pad_to_block(jkey, BKVSIZE, axis=2)[0]
+        jvalue = pad_to_block(jvalue, BKVSIZE, axis=2)[0]
+        res = _tpu_sageattention(jquery, jkey, jvalue, env, scale=kwargs.get('scale'), is_causal=is_causal, window_size=kwargs.get('window_size'))
         return env.j2t_iso(res)
-    elif backend == 'splash':
+    elif selected_backend == 'splash':
         jquery, jkey, jvalue = env.t2j_iso((query, key, value))
-        res = _tpu_splash_attention(jquery, jkey, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
+        res = _tpu_splash_attention(jquery, jkey, jvalue, env, scale=kwargs.get('scale'), is_causal=is_causal, window_size=kwargs.get('window_size'))
         return env.j2t_iso(res)
-    elif backend == 'aqt':
+    elif selected_backend == 'aqt':
         jquery, jkey, jvalue = env.t2j_iso((query, key, value))
-        jquery = pad_to_block(jquery, BQSIZE, axis=2)
-        jkey = pad_to_block(jkey, BKVSIZE, axis=2)
-        jvalue = pad_to_block(jvalue, BKVSIZE, axis=2)
+        jquery = pad_to_block(jquery, BQSIZE, axis=2)[0]
+        jkey = pad_to_block(jkey, BKVSIZE, axis=2)[0]
+        jvalue = pad_to_block(jvalue, BKVSIZE, axis=2)[0]
 
         key_mean = jnp.mean(jkey, axis=2, keepdims=True)
         jkey_smoothed = jkey - key_mean
 
-        #res = _tpu_aqt_attention(jquery, jkey, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
-        res = _tpu_aqt_attention(jquery, jkey_smoothed, jvalue, env, scale=scale, is_causal=is_causal, window_size=window_size)
+        res = _tpu_aqt_attention(jquery, jkey_smoothed, jvalue, env, scale=kwargs.get('scale'), is_causal=is_causal, window_size=kwargs.get('window_size'))
         return env.j2t_iso(res)
-    return _sdpa_reference(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
+    elif selected_backend == 'ring':
+        return _tpu_ring_attention(query, key, value, env)
+    return _sdpa_reference(query, key, value, attn_mask, dropout_p, is_causal, kwargs.get('scale'), kwargs.get('enable_gqa'))
 
 ###
 
@@ -705,150 +786,331 @@ def sharded_device_put(tensor, sharding):
   ]
   return jax.make_array_from_single_device_arrays(shape, sharding, x_split)
 
+def _ring_attention_on_slices(query, key, value, axis_size, sequence_axis_name):
+    """
+    【修正版v2】纯粹的 Ring Attention 实现。
+    此版本确保没有任何对 Splash Attention (make_splash_mha, CausalMask) 的调用。
+    请用此函数完整替换你现有的 _ring_attention_on_slices 函数。
+    """
+    is_3d_input = False
+    if query.ndim == 3:
+        is_3d_input = True
+        batch_size, q_seq_len, dim = query.shape
+        # 对于14B模型，transformer block中的维度是1536，头数是40
+        if dim == 1536:
+            num_heads = 40
+        else:
+            # 一个备用逻辑，以防万一
+            num_heads = query.shape[1] // 64
+
+        if dim % num_heads != 0:
+            raise ValueError(f"Dimension {dim} is not divisible by num_heads {num_heads}")
+        head_dim = dim // num_heads
+
+        query = query.reshape(batch_size, q_seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+        key = key.reshape(batch_size, key.shape[1], num_heads, head_dim).transpose(0, 2, 1, 3)
+        value = value.reshape(batch_size, value.shape[1], num_heads, head_dim).transpose(0, 2, 1, 3)
+    else:
+        batch_size, num_heads, q_seq_len, head_dim = query.shape
+
+    max_logit_accumulator = jnp.full((batch_size, num_heads, q_seq_len, 1), -jnp.inf, dtype=query.dtype)
+    value_accumulator = jnp.zeros_like(query)
+    weights_accumulator = jnp.zeros((batch_size, num_heads, q_seq_len, 1), dtype=query.dtype)
+
+    kv_chunk = jnp.concatenate([key, value], axis=-1)
+    dot_dims_qk = (((3,), (3,)), ((0, 1), (0, 1)))
+    dot_dims_sv = (((3,), (2,)), ((0, 1), (0, 1)))
+
+    def loop_body(i, state):
+        max_logit_accum, value_accum, weights_accum, current_kv_chunk = state
+        
+        current_key = current_kv_chunk[..., :head_dim]
+        current_value = current_kv_chunk[..., head_dim:]
+
+        # --- 核心Ring Attention逻辑，不包含任何Splash Attention代码 ---
+        logits = jax.lax.dot_general(query, current_key, dimension_numbers=dot_dims_qk)
+        logits = logits / jnp.sqrt(head_dim)
+
+        old_max_logit = max_logit_accum
+        new_max_logit = jnp.maximum(old_max_logit, jnp.max(logits, axis=-1, keepdims=True))
+
+        exp_old_to_new_max = jnp.exp(old_max_logit - new_max_logit)
+        rescaled_value_accum = value_accum * exp_old_to_new_max
+        rescaled_weights_accum = weights_accum * exp_old_to_new_max
+
+        exp_logits = jnp.exp(logits - new_max_logit)
+        current_weighted_value = jax.lax.dot_general(exp_logits, current_value, dimension_numbers=dot_dims_sv)
+        
+        new_value_accum = rescaled_value_accum + current_weighted_value
+        new_weights_accum = rescaled_weights_accum + jnp.sum(exp_logits, axis=-1, keepdims=True)
+
+        next_kv_chunk = jax.lax.ppermute(
+            current_kv_chunk,
+            axis_name=sequence_axis_name,
+            perm=[(j, (j - 1 + axis_size) % axis_size) for j in range(axis_size)]
+        )
+
+        return new_max_logit, new_value_accum, new_weights_accum, next_kv_chunk
+
+    initial_state = (max_logit_accumulator, value_accumulator, weights_accumulator, kv_chunk)
+    _, final_value_sum, final_weights_sum, _ = jax.lax.fori_loop(
+        0, axis_size, loop_body, initial_state
+    )
+
+    final_output = final_value_sum / jnp.maximum(final_weights_sum, 1e-6)
+    
+    if is_3d_input:
+        final_output = final_output.transpose(0, 2, 1, 3).reshape(batch_size, q_seq_len, -1)
+
+    return final_output
+
+def _tpu_ring_attention(query, key, value, env, axis_size=None, sequence_axis_name='sp'):
+    """
+    分布式 ring attention kernel，和 splash/aqt attention 并列可选。
+    """
+    mesh = env._mesh
+    if axis_size is None:
+        axis_size = mesh.shape['sp']
+    qkv_partition_spec = P('dp', 'sp', None)
+    def kernel(q, k, v):
+        return _ring_attention_on_slices(q, k, v, axis_size, sequence_axis_name)
+    sharded_fn = shard_map(
+        kernel,
+        mesh=mesh,
+        in_specs=(qkv_partition_spec, qkv_partition_spec, qkv_partition_spec),
+        out_specs=qkv_partition_spec,
+        check_rep=False,
+    )
+    return sharded_fn(query, key, value)
+
+# 1. 定义支持 attention_fn 的 Processor
+class CustomWanAttnProcessor2_0(WanAttnProcessor2_0):
+    def __init__(self, attention_fn, env):
+        super().__init__()
+        self.attention_fn = attention_fn
+        self.env = env
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, rotary_emb=None):
+        encoder_hidden_states_img = None
+        if attn.add_k_proj is not None:
+            encoder_hidden_states_img = encoder_hidden_states[:, :257]
+            encoder_hidden_states = encoder_hidden_states[:, 257:]
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        query = jnp.transpose(query.unflatten(2, (attn.heads, -1)), (0, 2, 1, 3))
+        key = jnp.transpose(key.unflatten(2, (attn.heads, -1)), (0, 2, 1, 3))
+        value = jnp.transpose(value.unflatten(2, (attn.heads, -1)), (0, 2, 1, 3))
+
+        if rotary_emb is not None:
+            def apply_rotary_emb(hidden_states, freqs):
+                import numpy as np
+                if hasattr(hidden_states, 'unflatten') and hasattr(hidden_states, 'to'):
+                    x_rotated = torch.view_as_complex(hidden_states.to(torch.float32).unflatten(3, (-1, 2)))
+                    x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
+                    return x_out.type_as(hidden_states)
+                else:
+                    import jax
+                    import jax.numpy as jnp
+                    shape = hidden_states.shape
+                    x = hidden_states.astype(jnp.float32).reshape(shape[:3] + (-1, 2))
+                    x_rotated = jax.lax.complex(x[..., 0], x[..., 1])
+                    if freqs.shape != x_rotated.shape:
+                        freqs = jnp.broadcast_to(freqs, x_rotated.shape)
+                    x_out = x_rotated * freqs
+                    x_out_real = jnp.stack([jnp.real(x_out), jnp.imag(x_out)], axis=-1)
+                    new_shape = x_out_real.shape[:3] + (x_out_real.shape[3] * x_out_real.shape[4],)
+                    x_out_real = x_out_real.reshape(new_shape)
+                    return x_out_real.astype(hidden_states.dtype)
+            query = apply_rotary_emb(query, rotary_emb)
+            key = apply_rotary_emb(key, rotary_emb)
+
+        hidden_states_img = None
+        if encoder_hidden_states_img is not None:
+            key_img = attn.add_k_proj(encoder_hidden_states_img)
+            key_img = attn.norm_added_k(key_img)
+            value_img = attn.add_v_proj(encoder_hidden_states_img)
+            key_img = jnp.transpose(key_img.unflatten(2, (attn.heads, -1)), (0, 2, 1, 3))
+            value_img = jnp.transpose(value_img.unflatten(2, (attn.heads, -1)), (0, 2, 1, 3))
+            hidden_states_img = self.attention_fn(query, key_img, value_img, attn_mask=None, dropout_p=0.0, is_causal=False)
+            b, h, s, d = hidden_states_img.shape
+            hidden_states_img = jnp.transpose(hidden_states_img, (0, 2, 1, 3)).reshape(b, s, h * d)
+            hidden_states_img = hidden_states_img.type_as(query)
+
+        hidden_states = self.attention_fn(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
+        b, h, s, d = hidden_states.shape
+        hidden_states = jnp.transpose(hidden_states, (0, 2, 1, 3)).reshape(b, s, h * d)
+        hidden_states = hidden_states.astype(query.dtype)
+
+        if hidden_states_img is not None:
+            hidden_states = hidden_states + hidden_states_img
+
+        hidden_states = self.env.j2t_iso(hidden_states)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
 def main():
-  # Set JAX config to enable compilation cache
-  jax.config.update("jax_compilation_cache_dir", "/dev/shm/jax_cache")
-  jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-  jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-  jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+    args = parse_args()
+    # Set JAX config to enable compilation cache
+    jax.config.update("jax_compilation_cache_dir", "/dev/shm/jax_cache")
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
 
-  torch.set_default_dtype(torch.bfloat16)
-  # Available models: Wan-AI/Wan2.1-T2V-14B-Diffusers, Wan-AI/Wan2.1-T2V-1.3B-Diffusers
-  #model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-  # model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
-  model_id = args.model_id
-  
-  # Initialize JAX environment first
-  torchax.enable_globally()
-  env = torchax.default_env()
-  # Create a 2D mesh for FSDP sharding
-  
-  tp_dim, dp_dim, sp_dim = len(jax.devices()), 1, 1
-  if args.use_dp:
-    # tp_dim > 8, which is v6e-16, could not divide head_dim=40, need use dp
-    print(f"{args.use_dp=}")
-    tp_dim //= 2
-    dp_dim = 2
-  
-  if args.sp_num > 1:
-    print(f"{args.sp_num=}")
-    tp_dim //= args.sp_num
-    sp_dim = args.sp_num
-
-  print(f"{tp_dim=}, {dp_dim=}, {sp_dim=}")
-     
-  # mesh = jax.make_mesh((len(jax.devices()), 1), (axis, 'fsdp'))
-  mesh_devices = mesh_utils.create_device_mesh((tp_dim, dp_dim, sp_dim), allow_split_physical_axes=True)
-  mesh = Mesh(mesh_devices, (axis,'dp','sp'))
-
-  env.default_device_or_sharding = NamedSharding(mesh, P())
-  env._mesh = mesh
-  #env.config.use_tpu_splash_attention = True
-  env.config.tpu_attention_backend = args.tpu_attention_backend
-
-  # Initialize JAX VAE
-  key = jax.random.key(0)
-  rngs = nnx.Rngs(key)
-  
-  # Create JAX VAE with default parameters
-  wan_vae = AutoencoderKLWan(
-      rngs=rngs,
-      base_dim=96,
-      z_dim=16,
-      dim_mult=[1, 2, 4, 4],
-      num_res_blocks=2,
-      attn_scales=[],
-      temperal_downsample=[False, True, True],
-      mesh=mesh
-  )
-  
-  with mesh:
-    # Create VAE cache
-    vae_cache = AutoencoderKLWanCache(wan_vae)
+    torch.set_default_dtype(torch.bfloat16)
+    # Available models: Wan-AI/Wan2.1-T2V-14B-Diffusers, Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+    #model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    # model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+    model_id = args.model_id
     
-    # Load pretrained weights
-    graphdef, state = nnx.split(wan_vae)
-    params = state.to_pure_dict()
-    params = load_wan_vae_fixed(model_id, params, "tpu")
-    # 保证全部 replicate 到 mesh 上所有 device
-    sharding = NamedSharding(mesh, P())
-    params = jax.tree_util.tree_map(lambda x: sharded_device_put(x, sharding), params)
-    params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)
-    wan_vae = nnx.merge(graphdef, params)
-
-    # Shard vae
-    p_create_sharded_logical_model = functools.partial(create_sharded_logical_model, logical_axis_rules=LOGICAL_AXIS_RULES)
-    wan_vae = p_create_sharded_logical_model(model=wan_vae)
-  
-  
-  # Skip PyTorch VAE loading to avoid torchax interference
-  # We'll use JAX VAE directly
-  
-  # Temporarily disable torchax to load pipeline components
-  torchax.disable_globally()
-  
-  try:
-    # flow_shift = 5.0 # 5.0 for 720P, 3.0 for 480P
-    flow_shift = args.flow_shift
-    scheduler = UniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
-    
-    # Load pipeline without VAE to avoid torchax interference
-    pipe = WanPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16, use_safetensors=True)
-    pipe.scheduler = scheduler
-  finally:
-    # Re-enable torchax for the rest of the pipeline
+    # Initialize JAX environment first
     torchax.enable_globally()
-  
-  # Replace the VAE in the pipeline with our JAX VAE
-  vae_config = ConfigWrapper(
-      latents_mean=np.array(wan_vae.latents_mean),
-      latents_std=np.array(wan_vae.latents_std),
-      z_dim=wan_vae.z_dim
-  )
-  pipe.vae = VAEProxy(wan_vae, vae_cache, torch.bfloat16, vae_config)
-  pipe.vae_cache = vae_cache
+    env = torchax.default_env()
+    # Create a 2D mesh for FSDP sharding
+    
+    tp_dim, dp_dim, sp_dim = len(jax.devices()), 1, 1
+    if args.use_dp:
+        # tp_dim > 8, which is v6e-16, could not divide head_dim=40, need use dp
+        print(f"{args.use_dp=}")
+        tp_dim //= 2
+        dp_dim = 2
+    
+    if args.sp_num > 1:
+        print(f"{args.sp_num=}")
+        tp_dim //= args.sp_num
+        sp_dim = args.sp_num
 
-  # 伪装 config
-  vae_config = ConfigWrapper(
-      latents_mean=np.array(wan_vae.latents_mean),
-      latents_std=np.array(wan_vae.latents_std),
-      z_dim=wan_vae.z_dim
-  )
-  pipe.vae.config = vae_config
+    print(f"{tp_dim=}, {dp_dim=}, {sp_dim=}")
+       
+    # mesh = jax.make_mesh((len(jax.devices()), 1), (axis, 'fsdp'))
+    mesh_devices = mesh_utils.create_device_mesh((tp_dim, dp_dim, sp_dim), allow_split_physical_axes=True)
+    mesh = Mesh(mesh_devices, (axis,'dp','sp'))
 
-  # print('vae=====')
-  # _print_weights(pipe.vae)
-  # print('trans===')
-  # print(_get_weights_of_linear(pipe.transformer).keys())
-  # print('encoder===')
-  # _print_weights(pipe.text_encoder)
-  # return
+    env.default_device_or_sharding = NamedSharding(mesh, P())
+    env._mesh = mesh
+    #env.config.use_tpu_splash_attention = True
+    env.config.tpu_attention_backend = 'ring'
 
-  def _move_module(module):
-    with jax.default_device('cpu'):
-      state_dict  = module.state_dict()
-      state_dict = env.to_xla(state_dict)
-      module.load_state_dict(state_dict, assign=True)
+    # Initialize JAX VAE
+    key = jax.random.key(0)
+    rngs = nnx.Rngs(key)
+    
+    # Create JAX VAE with default parameters
+    wan_vae = AutoencoderKLWan(
+        rngs=rngs,
+        base_dim=96,
+        z_dim=16,
+        dim_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        attn_scales=[],
+        temperal_downsample=[False, True, True],
+        mesh=mesh
+    )
+    
+    with mesh:
+        # Create VAE cache
+        vae_cache = AutoencoderKLWanCache(wan_vae)
+        
+        # Load pretrained weights
+        graphdef, state = nnx.split(wan_vae)
+        params = state.to_pure_dict()
+        params = load_wan_vae_fixed(model_id, params, "tpu")
+        # 保证全部 replicate 到 mesh 上所有 device
+        sharding = NamedSharding(mesh, P())
+        params = jax.tree_util.tree_map(lambda x: sharded_device_put(x, sharding), params)
+        params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)
+        wan_vae = nnx.merge(graphdef, params)
 
-  # Re-enable torchax for the rest of the pipeline
-  # torchax.enable_globally()  # Already enabled above
-  # env = torchax.default_env()  # Already initialized above
-  # mesh = jax.make_mesh((len(jax.devices()), 1), (axis, 'fsdp'))  # Already created above
-  # env.default_device_or_sharding = NamedSharding(mesh, P())  # Already set above
-  # env._mesh = mesh  # Already set above
-  # env.config.use_tpu_splash_attention = True  # Already set above
+        # Shard vae
+        p_create_sharded_logical_model = functools.partial(create_sharded_logical_model, logical_axis_rules=LOGICAL_AXIS_RULES)
+        wan_vae = p_create_sharded_logical_model(model=wan_vae)
+    
+    
+    # Skip PyTorch VAE loading to avoid torchax interference
+    # We'll use JAX VAE directly
+    
+    # Temporarily disable torchax to load pipeline components
+    torchax.disable_globally()
+    
+    try:
+        # flow_shift = 5.0 # 5.0 for 720P, 3.0 for 480P
+        flow_shift = args.flow_shift
+        scheduler = UniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
+        
+        # Load pipeline without VAE to avoid torchax interference
+        pipe = WanPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16, use_safetensors=True)
+        pipe.scheduler = scheduler
+    finally:
+        # Re-enable torchax for the rest of the pipeline
+        torchax.enable_globally()
+    
+    # Replace the VAE in the pipeline with our JAX VAE
+    vae_config = ConfigWrapper(
+        latents_mean=np.array(wan_vae.latents_mean),
+        latents_std=np.array(wan_vae.latents_std),
+        z_dim=wan_vae.z_dim
+    )
+    pipe.vae = VAEProxy(wan_vae, vae_cache, torch.bfloat16, vae_config)
+    pipe.vae_cache = vae_cache
 
-  # <--- MODIFIED: Override flash attention with custom function, now with window_size --->
-  custom_attention = functools.partial(
-      scaled_dot_product_attention,
-      env=env,
-      window_size=args.window_size # Inject the global window size setting here
-  )
-  # Workaround for the function lack is_view_op argument
-  # env.override_op_definition(torch.nn.functional.scaled_dot_product_attention, custom_attention)
-  op_to_override = torch.nn.functional.scaled_dot_product_attention
-  op_impl = custom_attention
-  env._ops[op_to_override] = ops_registry.Operator(
+    # 伪装 config
+    vae_config = ConfigWrapper(
+        latents_mean=np.array(wan_vae.latents_mean),
+        latents_std=np.array(wan_vae.latents_std),
+        z_dim=wan_vae.z_dim
+    )
+    pipe.vae.config = vae_config
+
+    # print('vae=====')
+    # _print_weights(pipe.vae)
+    # print('trans===')
+    # print(_get_weights_of_linear(pipe.transformer).keys())
+    # print('encoder===')
+    # _print_weights(pipe.text_encoder)
+    # return
+
+    def _move_module(module):
+        with jax.default_device('cpu'):
+            state_dict  = module.state_dict()
+            state_dict = env.to_xla(state_dict)
+            module.load_state_dict(state_dict, assign=True)
+
+    # Re-enable torchax for the rest of the pipeline
+    # torchax.enable_globally()  # Already enabled above
+    # env = torchax.default_env()  # Already initialized above
+    # mesh = jax.make_mesh((len(jax.devices()), 1), (axis, 'fsdp'))  # Already created above
+    # env.default_device_or_sharding = NamedSharding(mesh, P())  # Already set above
+    # env._mesh = mesh  # Already set above
+    # env.config.use_tpu_splash_attention = True  # Already set above
+
+    # <--- MODIFIED: Override flash attention with custom function, now with window_size --->
+    custom_attention = functools.partial(
+        scaled_dot_product_attention,
+        env=env,
+        window_size=args.window_size
+    )
+    print("Replacing attention processors with JAX-compatible version...")
+    jax_compatible_processor = CustomWanAttnProcessor2_0(attention_fn=custom_attention, env=env)
+    for block in pipe.transformer.blocks:
+        block.attn1.set_processor(jax_compatible_processor)
+        block.attn2.set_processor(jax_compatible_processor)
+    print("Attention processors replaced.")
+    # Workaround for the function lack is_view_op argument
+    # env.override_op_definition(torch.nn.functional.scaled_dot_product_attention, custom_attention)
+    op_to_override = torch.nn.functional.scaled_dot_product_attention
+    op_impl = custom_attention
+    env._ops[op_to_override] = ops_registry.Operator(
         op_to_override,
         op_impl,
         is_jax_function=False,
@@ -857,133 +1119,133 @@ def main():
         is_view_op=False,
     )
 
-  # Compile modules with torchax (skip VAE as it's already JAX)
-  vae_options = torchax.CompileOptions(
-    methods_to_compile=['decode']
-  )
-  # Skip VAE compilation as it's already JAX
-  # _move_module(pipe.vae)
-  # pipe.vae = torchax.compile(pipe.vae)
-  
-  if args.t5_cpu:
-    # 只把 text_encoder 移到 CPU，不做 compile 和 shard
-    pipe.text_encoder.to("cpu")
-  else:
-    # TPU 路径，做 compile 和 shard
-    _move_module(pipe.text_encoder)
-    pipe.text_encoder = torchax.compile(pipe.text_encoder)
-    pipe.text_encoder.params = _shard_weight_dict(pipe.text_encoder.params, text_encoder_shardings, mesh)
-    pipe.text_encoder.buffers = _shard_weight_dict(pipe.text_encoder.buffers, text_encoder_shardings, mesh)
-
-  # the param below is not declared as param or buffer so the module.to('jax') didnt work
-  _move_module(pipe.transformer)
-  pipe.transformer.rope.freqs = pipe.transformer.rope.freqs.to('jax')
-  options = torchax.CompileOptions(
-      jax_jit_kwargs={'static_argnames': ('return_dict',)}
-  )
-  pipe.transformer = torchax.compile(pipe.transformer, options)
-
-  #pipe.to('jax')
-  print('Number of devices is:, ', len(jax.devices()))
-
-  pipe.transformer.params = _shard_weight_dict(pipe.transformer.params, 
-                                               transformer_shardings,
-                                               mesh)
-  pipe.transformer.buffers = _shard_weight_dict(pipe.transformer.buffers, 
-                                               transformer_shardings,
-                                               mesh)
-
-  # Skip VAE sharding as it's already JAX and handled differently
-  # pipe.vae.params = _shard_weight_dict(pipe.vae.params, {}, mesh)
-  # pipe.vae.buffers = _shard_weight_dict(pipe.vae.buffers, {}, mesh)
-
-  def move_scheduler(scheduler):
-    for k, v in scheduler.__dict__.items():
-      if isinstance(v, torch.Tensor):
-        setattr(scheduler, k, v.to('jax'))
-
-  #move_scheduler(pipe.scheduler)
-
-  def module_size(module):
-    size = 0
-    for k, v in module.state_dict().items():
-      size += math.prod(v.shape) * v.dtype.itemsize
-    return size
-
-  for m in dir(pipe):
-      module = getattr(pipe, m, None)
-      if isinstance(module, torch.nn.Module):
-          print(m, module_size(module) / (1024 * 1024 * 1024), 'G')
-      elif m == 'vae' and hasattr(pipe, 'vae_cache'):
-          # JAX VAE size calculation
-          print(f"{m} (JAX VAE) - size calculation not implemented")
-
-
-  prompt = "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window."
-  # prompt = "Drone view of waves crashing against the rugged cliffs along Big Sur's garay point beach.The crashing blue waters create white-tipped waves,while the golden light of the setting sun illuminates the rocky shore. A small island with a lighthouse sits in the distance, and greenshrubbery covers the cliffs edge. The steep drop from the road down to the beach is adramatic feat, with the cliff's edges jutting out over the sea. This is a view that captures the raw beauty of the coast and the rugged landscape of the Pacific Coast Highway."
-  negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
-
-  generator = torch.Generator()
-  generator.manual_seed(42)
-  with mesh, nn_partitioning.axis_rules(LOGICAL_AXIS_RULES):
-    # warm up and save video
-    pipe_kwargs = {
-        'prompt': prompt,
-        'negative_prompt': negative_prompt,
-        'height': args.height,
-        'width': args.width,
-        'num_inference_steps': args.num_inference_steps,
-        'num_frames': args.frames,
-        'guidance_scale': 5.0,
-        'generator': generator,
-        'use_dp': args.use_dp,
-    }
+    # Compile modules with torchax (skip VAE as it's already JAX)
+    vae_options = torchax.CompileOptions(
+        methods_to_compile=['decode']
+    )
+    # Skip VAE compilation as it's already JAX
+    # _move_module(pipe.vae)
+    # pipe.vae = torchax.compile(pipe.vae)
     
-    output = pipe(**pipe_kwargs).frames[0]
-    #print("output type:", type(output), "output shape:", output.shape)
-    #if hasattr(output, 'shape'):
-    #    print("output shape:", output.shape)
-    #elif isinstance(output, (list, tuple)):
-    #    for i, v in enumerate(output):
-    #        print(f"output[{i}] type: {type(v)}, shape: {getattr(v, 'shape', None)}")
-    output = prepare_video_for_export(output)
-    if isinstance(output, np.ndarray) and output.ndim == 4 and output.shape[-2] == 3:
-        output = output.transpose(3, 0, 1, 2)
-    current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"{current_datetime}.mp4"
-    export_to_video(output, file_name, fps=args.fps)
-    print(f"output video done. {file_name}")
-    
-    if args.profile:
-      # profile set fewer step and output latent to skip VAE for now
-      # output_type='latent' will skip VAE
-      jax.profiler.start_trace(PROFILE_OUT_PATH)
-      output = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        height=args.height,
-        width=args.width,
-        num_inference_steps=3,
-        num_frames=args.frames,
-        guidance_scale=5.0,
-        output_type="latent",
-        generator=generator,
-        use_dp=args.use_dp,
-      )
-      jax.effects_barrier()
-      jax.profiler.stop_trace()
-      print("profile done")
-    
-    # Benchmark loop
-    for i in range(1):
-      start = time.perf_counter()
-      output = pipe(**pipe_kwargs)
-      # make sure all computation done
-      jax.effects_barrier()
-      end = time.perf_counter()  
-      print(f'Iteration {i} BKVSIZE={BKVSIZE}, BQSIZE={BQSIZE}: {end - start:.6f}s')
+    if args.t5_cpu:
+        # 只把 text_encoder 移到 CPU，不做 compile 和 shard
+        pipe.text_encoder.to("cpu")
+    else:
+        # TPU 路径，做 compile 和 shard
+        _move_module(pipe.text_encoder)
+        pipe.text_encoder = torchax.compile(pipe.text_encoder)
+        pipe.text_encoder.params = _shard_weight_dict(pipe.text_encoder.params, text_encoder_shardings, mesh)
+        pipe.text_encoder.buffers = _shard_weight_dict(pipe.text_encoder.buffers, text_encoder_shardings, mesh)
+
+    # the param below is not declared as param or buffer so the module.to('jax') didnt work
+    _move_module(pipe.transformer)
+    pipe.transformer.rope.freqs = pipe.transformer.rope.freqs.to('jax')
+    options = torchax.CompileOptions(
+        jax_jit_kwargs={'static_argnames': ('return_dict',)}
+    )
+    pipe.transformer = torchax.compile(pipe.transformer, options)
+
+    #pipe.to('jax')
+    print('Number of devices is:, ', len(jax.devices()))
+
+    pipe.transformer.params = _shard_weight_dict(pipe.transformer.params, 
+                                                 transformer_shardings,
+                                                 mesh)
+    pipe.transformer.buffers = _shard_weight_dict(pipe.transformer.buffers, 
+                                                 transformer_shardings,
+                                                 mesh)
+
+    # Skip VAE sharding as it's already JAX and handled differently
+    # pipe.vae.params = _shard_weight_dict(pipe.vae.params, {}, mesh)
+    # pipe.vae.buffers = _shard_weight_dict(pipe.vae.buffers, {}, mesh)
+
+    def move_scheduler(scheduler):
+        for k, v in scheduler.__dict__.items():
+            if isinstance(v, torch.Tensor):
+                setattr(scheduler, k, v.to('jax'))
+
+    #move_scheduler(pipe.scheduler)
+
+    def module_size(module):
+        size = 0
+        for k, v in module.state_dict().items():
+            size += math.prod(v.shape) * v.dtype.itemsize
+        return size
+
+    for m in dir(pipe):
+        module = getattr(pipe, m, None)
+        if isinstance(module, torch.nn.Module):
+            print(m, module_size(module) / (1024 * 1024 * 1024), 'G')
+        elif m == 'vae' and hasattr(pipe, 'vae_cache'):
+            # JAX VAE size calculation
+            print(f"{m} (JAX VAE) - size calculation not implemented")
+
+
+    prompt = "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window."
+    # prompt = "Drone view of waves crashing against the rugged cliffs along Big Sur's garay point beach.The crashing blue waters create white-tipped waves,while the golden light of the setting sun illuminates the rocky shore. A small island with a lighthouse sits in the distance, and greenshrubbery covers the cliffs edge. The steep drop from the road down to the beach is adramatic feat, with the cliff's edges jutting out over the sea. This is a view that captures the raw beauty of the coast and the rugged landscape of the Pacific Coast Highway."
+    negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+
+    generator = torch.Generator()
+    generator.manual_seed(42)
+    with mesh, nn_partitioning.axis_rules(LOGICAL_AXIS_RULES):
+        # warm up and save video
+        pipe_kwargs = {
+            'prompt': prompt,
+            'negative_prompt': negative_prompt,
+            'height': args.height,
+            'width': args.width,
+            'num_inference_steps': args.num_inference_steps,
+            'num_frames': args.frames,
+            'guidance_scale': 5.0,
+            'generator': generator,
+            'use_dp': args.use_dp,
+        }
         
-  print('DONE')
+        output = pipe(**pipe_kwargs).frames[0]
+        #print("output type:", type(output), "output shape:", output.shape)
+        #if hasattr(output, 'shape'):
+        #    print("output shape:", output.shape)
+        #elif isinstance(output, (list, tuple)):
+        #    for i, v in enumerate(output):
+        #        print(f"output[{i}] type: {type(v)}, shape: {getattr(v, 'shape', None)}")
+        output = prepare_video_for_export(output)
+        if isinstance(output, np.ndarray) and output.ndim == 4 and output.shape[-2] == 3:
+            output = output.transpose(3, 0, 1, 2)
+        current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = f"{current_datetime}.mp4"
+        export_to_video(output, file_name, fps=args.fps)
+        print(f"output video done. {file_name}")
+        
+        if args.profile:
+            # profile set fewer step and output latent to skip VAE for now
+            # output_type='latent' will skip VAE
+            jax.profiler.start_trace(PROFILE_OUT_PATH)
+            output = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=args.height,
+                width=args.width,
+                num_inference_steps=3,
+                num_frames=args.frames,
+                guidance_scale=5.0,
+                output_type="latent",
+                generator=generator,
+                use_dp=args.use_dp,
+            )
+            jax.effects_barrier()
+            jax.profiler.stop_trace()
+            print("profile done")
+        
+        # Benchmark loop
+        for i in range(1):
+            start = time.perf_counter()
+            output = pipe(**pipe_kwargs)
+            # make sure all computation done
+            jax.effects_barrier()
+            end = time.perf_counter()  
+            print(f'Iteration {i} BKVSIZE={BKVSIZE}, BQSIZE={BQSIZE}: {end - start:.6f}s')
+        
+    print('DONE')
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -1001,12 +1263,8 @@ def parse_args():
     parser.add_argument("--bqsize", type=int, default=BQSIZE, help="Block Q size")
     parser.add_argument("--bkvsize", type=int, default=BKVSIZE, help="Block KV size")
     parser.add_argument("--profile", action="store_true", default=False, help="Add profiler")
-    parser.add_argument("--tpu_attention_backend", type=str, choices=['splash', 'sage', 'aqt'], default='aqt', help="TPU attention backend to use")
+    parser.add_argument("--tpu_attention_backend", type=str, choices=['splash', 'sage', 'aqt', 'ring'], default='ring', help="TPU attention backend to use")
     return parser.parse_args()
 
 if __name__ == '__main__':
-  args = parse_args()
-  print(args)
-  BQSIZE = args.bqsize
-  BKVSIZE = args.bkvsize
-  main()
+    main()
