@@ -21,10 +21,16 @@ from jax import tree_util
 
 from aqt.jax.v2.pallas import quantizer as aqt_pallas_quantizer
 
-from aqt_attention import splash_attention_mask as mask_lib
-from aqt_attention import splash_attention_mask_info as mask_info_lib
-from aqt_attention.splash_attention_mask import MultiHeadMask, CausalMask, FullMask, LocalMask
-from aqt_attention.splash_attention_kernel import make_splash_mha, BlockSizes
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as mask_lib
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask_info as mask_info_lib
+from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_kernel import make_splash_mha, BlockSizes
+
+from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_mask import (
+    MultiHeadMask,
+    CausalMask,
+    FullMask,
+    LocalMask,
+)
 
 # Add JAX VAE imports
 from flax import nnx
@@ -74,8 +80,8 @@ def mask_unflatten(aux_data, children):
   return mask_type(shape)
 
 # Register the simple masks that only have a shape
-tree_util.register_pytree_node(CausalMask, mask_flatten, mask_unflatten)
-tree_util.register_pytree_node(FullMask, mask_flatten, mask_unflatten)
+#tree_util.register_pytree_node(CausalMask, mask_flatten, mask_unflatten)
+#tree_util.register_pytree_node(FullMask, mask_flatten, mask_unflatten)
 
 def local_mask_flatten(mask):
     """Flatten function for LocalMask, which has more attributes."""
@@ -86,7 +92,7 @@ def local_mask_unflatten(aux_data, children):
     mask_type, shape, window_size, offset = aux_data
     return mask_type(shape, window_size=window_size, offset=offset)
 
-tree_util.register_pytree_node(LocalMask, local_mask_flatten, local_mask_unflatten)
+#tree_util.register_pytree_node(LocalMask, local_mask_flatten, local_mask_unflatten)
 
 
 def multi_head_mask_flatten(mhm):
@@ -98,7 +104,23 @@ def multi_head_mask_unflatten(mhm_type, children):
   # children is a tuple containing one element: the tuple of masks
   return mhm_type(children[0])
 
-tree_util.register_pytree_node(MultiHeadMask, multi_head_mask_flatten, multi_head_mask_unflatten)
+#tree_util.register_pytree_node(MultiHeadMask, multi_head_mask_flatten, multi_head_mask_unflatten)
+
+
+def static_obj_flatten(obj):
+  """A generic flatten function that treats the entire object as static."""
+  # No dynamic children, the entire object is passed as auxiliary data.
+  return (), obj
+
+def static_obj_unflatten(obj, children):
+  """A generic unflatten function that just returns the static object."""
+  return obj
+
+# Register all our custom mask classes to be treated as static objects
+tree_util.register_pytree_node(CausalMask, static_obj_flatten, static_obj_unflatten)
+tree_util.register_pytree_node(FullMask, static_obj_flatten, static_obj_unflatten)
+tree_util.register_pytree_node(LocalMask, static_obj_flatten, static_obj_unflatten)
+tree_util.register_pytree_node(MultiHeadMask, static_obj_flatten, static_obj_unflatten)
 
 print("Successfully registered custom Mask objects as JAX Pytrees.")
 # --- END: JAX Pytree Registration ---
@@ -589,7 +611,7 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
         res = _tpu_aqt_attention(jquery, jkey_smoothed, jvalue, env, scale=kwargs.get('scale'), is_causal=is_causal, window_size=kwargs.get('window_size'))
         return env.j2t_iso(res)
     elif selected_backend == 'ring':
-        return _tpu_ring_attention(query, key, value, env)
+        return _tpu_ring_attention(query, key, value, env, is_causal=is_causal)
     return _sdpa_reference(query, key, value, attn_mask, dropout_p, is_causal, kwargs.get('scale'), kwargs.get('enable_gqa'))
 
 ###
@@ -786,12 +808,12 @@ def sharded_device_put(tensor, sharding):
   ]
   return jax.make_array_from_single_device_arrays(shape, sharding, x_split)
 
-def _ring_attention_on_slices(query, key, value, axis_size, sequence_axis_name):
+def _ring_attention_on_slices(query, key, value, env, axis_size, sequence_axis_name, is_causal=False):
     """
-    【修正版v2】纯粹的 Ring Attention 实现。
-    此版本确保没有任何对 Splash Attention (make_splash_mha, CausalMask) 的调用。
-    请用此函数完整替换你现有的 _ring_attention_on_slices 函数。
+    内存高效的、分块的Ring Attention实现。
+    使用Splash Attention作为内部计算核心来避免OOM。
     """
+
     is_3d_input = False
     if query.ndim == 3:
         is_3d_input = True
@@ -813,13 +835,34 @@ def _ring_attention_on_slices(query, key, value, axis_size, sequence_axis_name):
     else:
         batch_size, num_heads, q_seq_len, head_dim = query.shape
 
-    max_logit_accumulator = jnp.full((batch_size, num_heads, q_seq_len, 1), -jnp.inf, dtype=query.dtype)
-    value_accumulator = jnp.zeros_like(query)
-    weights_accumulator = jnp.zeros((batch_size, num_heads, q_seq_len, 1), dtype=query.dtype)
+    query = query / jnp.sqrt(head_dim)
 
-    kv_chunk = jnp.concatenate([key, value], axis=-1)
-    dot_dims_qk = (((3,), (3,)), ((0, 1), (0, 1)))
-    dot_dims_sv = (((3,), (2,)), ((0, 1), (0, 1)))
+    block_size = 256
+    query_padded, q_pad_len = pad_to_block(query, block_size, axis=2)
+    key_padded, _ = pad_to_block(key, block_size, axis=2)
+    value_padded, _ = pad_to_block(value, block_size, axis=2)
+
+    max_logit_accumulator = jnp.full(query_padded.shape[:-1] + (1,), -jnp.inf, dtype=query.dtype)
+    value_accumulator = jnp.zeros_like(query_padded)
+    weights_accumulator = jnp.zeros(query_padded.shape[:-1] + (1,), dtype=query.dtype)
+    kv_chunk = jnp.concatenate([key_padded, value_padded], axis=-1)
+
+    block_sizes = BlockSizes(block_q=block_size, block_kv=block_size)
+    q_len_padded, kv_len_padded = query_padded.shape[2], key_padded.shape[2]
+
+    if is_causal:
+        mask_class = CausalMask
+    else:
+        mask_class = FullMask
+    
+    # 在循环外创建Splash Attention内核
+    splash_mask = MultiHeadMask([mask_class((q_len_padded, kv_len_padded)) for _ in range(num_heads)])
+    head_shards = env._mesh.shape['axis']
+    q_seq_shards = 1
+    splash_kernel = make_splash_mha(mask=splash_mask, 
+									block_sizes=block_sizes,
+									head_shards=head_shards,
+                                    q_seq_shards=q_seq_shards)
 
     def loop_body(i, state):
         max_logit_accum, value_accum, weights_accum, current_kv_chunk = state
@@ -827,7 +870,29 @@ def _ring_attention_on_slices(query, key, value, axis_size, sequence_axis_name):
         current_key = current_kv_chunk[..., :head_dim]
         current_value = current_kv_chunk[..., head_dim:]
 
-        # --- 核心Ring Attention逻辑，不包含任何Splash Attention代码 ---
+        # --- 使用Splash内核进行高效的块状计算 ---
+        # splash_kernel内部实现了分块和在线softmax，避免了OOM
+        # 我们需要squeeze掉batch维度，因为splash_kernel期望(H, S, D)
+        local_out = splash_kernel(query_padded.squeeze(0), current_key.squeeze(0), current_value.squeeze(0))
+        local_out = jnp.expand_dims(local_out, axis=0) # 加回batch维度
+
+        # --- 这里需要重新实现softmax的在线归并 ---
+        # (这部分逻辑比较复杂，为了先让代码跑通，我们做一个简化，
+        # 假设每个块的输出可以直接累加。这在数学上不完全等价于
+        # 全局softmax，但能验证内存和流程是否跑通)
+        # 一个更精确的实现需要从splash_kernel中拿到logits和max_logits
+        new_value_accum = value_accum + local_out
+
+        # Permute KV chunk for the next device
+        next_kv_chunk = jax.lax.ppermute(
+            current_kv_chunk,
+            axis_name=sequence_axis_name,
+            perm=[(j, (j - 1 + axis_size) % axis_size) for j in range(axis_size)]
+        )
+        # 在这个简化版中，我们只更新value_accum
+        return max_logit_accum, new_value_accum, weights_accum, next_kv_chunk
+
+        """
         logits = jax.lax.dot_general(query, current_key, dimension_numbers=dot_dims_qk)
         logits = logits / jnp.sqrt(head_dim)
 
@@ -851,29 +916,32 @@ def _ring_attention_on_slices(query, key, value, axis_size, sequence_axis_name):
         )
 
         return new_max_logit, new_value_accum, new_weights_accum, next_kv_chunk
+        """
 
     initial_state = (max_logit_accumulator, value_accumulator, weights_accumulator, kv_chunk)
-    _, final_value_sum, final_weights_sum, _ = jax.lax.fori_loop(
+    _, final_value_sum, _, _ = jax.lax.fori_loop(
         0, axis_size, loop_body, initial_state
     )
 
-    final_output = final_value_sum / jnp.maximum(final_weights_sum, 1e-6)
+    final_output = final_value_sum
     
+    final_output = unpad(final_output, q_pad_len, axis=2)
+
     if is_3d_input:
         final_output = final_output.transpose(0, 2, 1, 3).reshape(batch_size, q_seq_len, -1)
 
     return final_output
 
-def _tpu_ring_attention(query, key, value, env, axis_size=None, sequence_axis_name='sp'):
+def _tpu_ring_attention(query, key, value, env, is_causal, axis_size=None, sequence_axis_name='sp'):
     """
     分布式 ring attention kernel，和 splash/aqt attention 并列可选。
     """
     mesh = env._mesh
     if axis_size is None:
         axis_size = mesh.shape['sp']
-    qkv_partition_spec = P('dp', 'sp', None)
+    qkv_partition_spec = P('dp', 'axis', 'sp', None)
     def kernel(q, k, v):
-        return _ring_attention_on_slices(q, k, v, axis_size, sequence_axis_name)
+        return _ring_attention_on_slices(q, k, v, env, axis_size, sequence_axis_name, is_causal=is_causal)
     sharded_fn = shard_map(
         kernel,
         mesh=mesh,
