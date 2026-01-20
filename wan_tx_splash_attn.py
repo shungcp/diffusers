@@ -16,6 +16,7 @@ from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 
 # Add JAX VAE imports
+import flax
 from flax import nnx
 from maxdiffusion.models.wan.autoencoder_kl_wan import (
     WanCausalConv3d,
@@ -238,7 +239,7 @@ register_pytree_node(
   unflatten_model_output)
 
 def make_key(name):
-  return re.sub('\.\d+\.', '.*.', name)
+  return re.sub(r'\.\d+\.', '.*.', name)
 
   
 def _get_weights_of_linear(module):
@@ -644,6 +645,10 @@ def sharded_device_put(tensor, sharding):
   return jax.make_array_from_single_device_arrays(shape, sharding, x_split)
 
 def main():
+
+  if hasattr(flax.config, 'flax_always_shard_variable'):
+    flax.config.update('flax_always_shard_variable', False)
+
   # Set JAX config to enable compilation cache
   jax.config.update("jax_compilation_cache_dir", "/dev/shm/jax_cache")
   jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
