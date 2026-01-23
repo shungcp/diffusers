@@ -1,4 +1,5 @@
 import functools
+from typing import Optional, List, Tuple, Union, Sequence
 import re
 import math
 import torch
@@ -18,6 +19,7 @@ from jax.experimental import mesh_utils
 # Add JAX VAE imports
 import flax
 from flax import nnx
+import flax.linen as nn
 from maxdiffusion.models.wan.autoencoder_kl_wan import (
     WanCausalConv3d,
     WanUpsample,
@@ -29,6 +31,9 @@ from maxdiffusion.models.wan.autoencoder_kl_wan import (
     ZeroPaddedConv2D,
     WanAttentionBlock,
     AutoencoderKLWanCache,
+    WanUpBlock,
+    WanEncoder3d,
+    WanDecoder3d,
 )
 from maxdiffusion.models.wan.wan_utils import load_wan_vae
 from flax.linen import partitioning as nn_partitioning
@@ -47,6 +52,456 @@ from datetime import datetime
 import traceback
 import types
 import argparse
+
+# Monkeypatches for Flax NNX Compatibility
+
+class Identity(nnx.Module):
+    def __call__(self, x):
+        return x
+
+# Monkeypatch WanMidBlock.__init__ to use nnx.List for list attributes
+def new_wan_mid_block_init(
+      self,
+      dim: int,
+      rngs: nnx.Rngs,
+      dropout: float = 0.0,
+      non_linearity: str = "silu",
+      num_layers: int = 1,
+      mesh: jax.sharding.Mesh = None,
+      dtype: jnp.dtype = jnp.float32,
+      weights_dtype: jnp.dtype = jnp.float32,
+      precision: jax.lax.Precision = None,
+  ):
+    self.dim = dim
+    resnets = [
+        WanResidualBlock(
+            in_dim=dim,
+            out_dim=dim,
+            rngs=rngs,
+            dropout=dropout,
+            non_linearity=non_linearity,
+            mesh=mesh,
+            dtype=dtype,
+            weights_dtype=weights_dtype,
+            precision=precision,
+        )
+    ]
+    attentions = []
+    for _ in range(num_layers):
+      attentions.append(
+          WanAttentionBlock(dim=dim, rngs=rngs, mesh=mesh, dtype=dtype, weights_dtype=weights_dtype, precision=precision)
+      )
+      resnets.append(
+          WanResidualBlock(
+              in_dim=dim,
+              out_dim=dim,
+              rngs=rngs,
+              dropout=dropout,
+              non_linearity=non_linearity,
+              mesh=mesh,
+              dtype=dtype,
+              weights_dtype=weights_dtype,
+              precision=precision,
+          )
+      )
+    if hasattr(nnx, 'List'):
+        self.attentions = nnx.List(attentions)
+        self.resnets = nnx.List(resnets)
+    else:
+        print("WARNING: nnx.List not found, trying raw list assignment (might fail)")
+        self.attentions = attentions
+        self.resnets = resnets
+
+WanMidBlock.__init__ = new_wan_mid_block_init
+
+# Monkeypatch WanResample.__init__ to avoid static attribute issue with time_conv
+def new_wan_resample_init(
+      self,
+      dim: int,
+      mode: str,
+      rngs: nnx.Rngs,
+      mesh: jax.sharding.Mesh = None,
+      dtype: jnp.dtype = jnp.float32,
+      weights_dtype: jnp.dtype = jnp.float32,
+      precision: jax.lax.Precision = None,
+  ):
+    self.dim = dim
+    self.mode = mode
+    # self.time_conv = None  <-- REMOVED to avoid nnx static attribute lock
+
+    if mode == "upsample2d":
+      self.resample = nnx.Sequential(
+          WanUpsample(scale_factor=(2.0, 2.0), method="nearest"),
+          nnx.Conv(
+              dim,
+              dim // 2,
+              kernel_size=(3, 3),
+              padding="SAME",
+              use_bias=True,
+              rngs=rngs,
+              kernel_init=nnx.with_partitioning(nnx.initializers.xavier_uniform(), (None, None, None, "conv_out")),
+              dtype=dtype,
+              param_dtype=weights_dtype,
+              precision=precision,
+          ),
+      )
+    elif mode == "upsample3d":
+      self.resample = nnx.Sequential(
+          WanUpsample(scale_factor=(2.0, 2.0), method="nearest"),
+          nnx.Conv(
+              dim,
+              dim // 2,
+              kernel_size=(3, 3),
+              padding="SAME",
+              use_bias=True,
+              rngs=rngs,
+              kernel_init=nnx.with_partitioning(nnx.initializers.xavier_uniform(), (None, None, None, "conv_out")),
+              dtype=dtype,
+              param_dtype=weights_dtype,
+              precision=precision,
+          ),
+      )
+      self.time_conv = WanCausalConv3d(
+          rngs=rngs,
+          in_channels=dim,
+          out_channels=dim * 2,
+          kernel_size=(3, 1, 1),
+          padding=(1, 0, 0),
+          mesh=mesh,
+          dtype=dtype,
+          weights_dtype=weights_dtype,
+          precision=precision,
+      )
+    elif mode == "downsample2d":
+      self.resample = ZeroPaddedConv2D(
+          dim=dim,
+          rngs=rngs,
+          kernel_size=(3, 3),
+          stride=(2, 2),
+          mesh=mesh,
+          dtype=dtype,
+          weights_dtype=weights_dtype,
+          precision=precision,
+      )
+    elif mode == "downsample3d":
+      self.resample = ZeroPaddedConv2D(
+          dim=dim,
+          rngs=rngs,
+          kernel_size=(3, 3),
+          stride=(2, 2),
+          mesh=mesh,
+          dtype=dtype,
+          weights_dtype=weights_dtype,
+          precision=precision,
+      )
+      self.time_conv = WanCausalConv3d(
+          rngs=rngs,
+          in_channels=dim,
+          out_channels=dim,
+          kernel_size=(3, 1, 1),
+          stride=(2, 1, 1),
+          padding=(0, 0, 0),
+          mesh=mesh,
+          dtype=dtype,
+          weights_dtype=weights_dtype,
+          precision=precision,
+      )
+    else:
+      self.resample = Identity()
+
+# Apply the monkeypatch
+WanResample.__init__ = new_wan_resample_init
+
+# Monkeypatch WanUpBlock.__init__ to use nnx.List for upsamplers
+def new_wan_up_block_init(
+      self,
+      in_dim: int,
+      out_dim: int,
+      num_res_blocks: int,
+      rngs: nnx.Rngs,
+      dropout: float = 0.0,
+      upsample_mode: Optional[str] = None,
+      non_linearity: str = "silu",
+      mesh: jax.sharding.Mesh = None,
+      dtype: jnp.dtype = jnp.float32,
+      weights_dtype: jnp.dtype = jnp.float32,
+      precision: jax.lax.Precision = None,
+  ):
+    from typing import Optional # Ensure Optional is available if not globally imported
+    
+    current_dim = in_dim
+    resnets = []
+    # Add residual blocks and attention if needed
+    for _ in range(num_res_blocks + 1):
+      resnets.append(
+          WanResidualBlock(
+              in_dim=current_dim,
+              out_dim=out_dim,
+              dropout=dropout,
+              non_linearity=non_linearity,
+              rngs=rngs,
+              mesh=mesh,
+              dtype=dtype,
+              weights_dtype=weights_dtype,
+              precision=precision,
+          )
+      )
+      current_dim = out_dim
+    
+    if hasattr(nnx, 'List'):
+        self.resnets = nnx.List(resnets)
+    else:
+        self.resnets = resnets
+
+    # Add upsampling layer if needed.
+    if upsample_mode is not None:
+      upsamplers = [
+          WanResample(
+              dim=out_dim,
+              mode=upsample_mode,
+              rngs=rngs,
+              mesh=mesh,
+              weights_dtype=weights_dtype,
+              dtype=dtype,
+              precision=precision,
+          )
+      ]
+      if hasattr(nnx, 'List'):
+          self.upsamplers = nnx.List(upsamplers)
+      else:
+          self.upsamplers = upsamplers
+    else:
+        self.upsamplers = None
+
+WanUpBlock.__init__ = new_wan_up_block_init
+
+# Monkeypatch WanEncoder3d.__init__ to use nnx.List for down_blocks
+def new_wan_encoder_3d_init(
+      self,
+      rngs: nnx.Rngs,
+      dim: int = 128,
+      z_dim: int = 4,
+      dim_mult=[1, 2, 4, 4],
+      num_res_blocks=2,
+      attn_scales=[],
+      temperal_downsample=[True, True, False],
+      dropout=0.0,
+      non_linearity: str = "silu",
+      mesh: jax.sharding.Mesh = None,
+      dtype: jnp.dtype = jnp.float32,
+      weights_dtype: jnp.dtype = jnp.float32,
+      precision: jax.lax.Precision = None,
+  ):
+    self.dim = dim
+    self.z_dim = z_dim
+    self.dim_mult = dim_mult
+    self.num_res_blocks = num_res_blocks
+    self.attn_scales = attn_scales
+    self.temperal_downsample = temperal_downsample
+    
+    if non_linearity == "silu":
+        self.nonlinearity = nn.silu
+    else:
+        from maxdiffusion.models.modeling_flax_utils import get_activation
+        self.nonlinearity = get_activation(non_linearity)
+
+    # dimensions
+    dims = [dim * u for u in [1] + dim_mult]
+    scale = 1.0
+
+    # init block
+    self.conv_in = WanCausalConv3d(
+        rngs=rngs,
+        in_channels=3,
+        out_channels=dims[0],
+        kernel_size=3,
+        padding=1,
+        mesh=mesh,
+        dtype=dtype,
+        weights_dtype=weights_dtype,
+        precision=precision,
+    )
+
+    # downsample blocks
+    down_blocks = []
+    for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+      # residual (+attention) blocks
+      for _ in range(num_res_blocks):
+        down_blocks.append(
+            WanResidualBlock(
+                in_dim=in_dim,
+                out_dim=out_dim,
+                dropout=dropout,
+                rngs=rngs,
+                mesh=mesh,
+                dtype=dtype,
+                weights_dtype=weights_dtype,
+                precision=precision,
+            )
+        )
+        if scale in attn_scales:
+          down_blocks.append(
+              WanAttentionBlock(
+                  dim=out_dim, rngs=rngs, mesh=mesh, dtype=dtype, weights_dtype=weights_dtype, precision=precision
+              )
+          )
+        in_dim = out_dim
+
+      # downsample block
+      if i != len(dim_mult) - 1:
+        mode = "downsample3d" if temperal_downsample[i] else "downsample2d"
+        down_blocks.append(
+            WanResample(
+                out_dim, mode=mode, rngs=rngs, mesh=mesh, dtype=dtype, weights_dtype=weights_dtype, precision=precision
+            )
+        )
+        scale /= 2.0
+
+    if hasattr(nnx, 'List'):
+        self.down_blocks = nnx.List(down_blocks)
+    else:
+        self.down_blocks = down_blocks
+
+    # middle_blocks
+    self.mid_block = WanMidBlock(
+        dim=out_dim,
+        rngs=rngs,
+        dropout=dropout,
+        non_linearity=non_linearity,
+        num_layers=1,
+        mesh=mesh,
+        dtype=dtype,
+        weights_dtype=weights_dtype,
+        precision=precision,
+    )
+
+    # output blocks
+    self.norm_out = WanRMS_norm(out_dim, channel_first=False, images=False, rngs=rngs)
+    self.conv_out = WanCausalConv3d(
+        rngs=rngs,
+        in_channels=out_dim,
+        out_channels=z_dim,
+        kernel_size=3,
+        padding=1,
+        mesh=mesh,
+        dtype=dtype,
+        weights_dtype=weights_dtype,
+        precision=precision,
+    )
+
+WanEncoder3d.__init__ = new_wan_encoder_3d_init
+
+# Monkeypatch WanDecoder3d.__init__ to use nnx.List for up_blocks
+def new_wan_decoder_3d_init(
+      self,
+      rngs: nnx.Rngs,
+      dim: int = 128,
+      z_dim: int = 4,
+      dim_mult: list = [1, 2, 4, 4],
+      num_res_blocks: int = 2,
+      attn_scales=list,
+      temperal_upsample=[False, True, True],
+      dropout=0.0,
+      non_linearity: str = "silu",
+      mesh: jax.sharding.Mesh = None,
+      dtype: jnp.dtype = jnp.float32,
+      weights_dtype: jnp.dtype = jnp.float32,
+      precision: jax.lax.Precision = None,
+  ):
+    self.dim = dim
+    self.z_dim = z_dim
+    self.dim_mult = dim_mult
+    self.num_res_blocks = num_res_blocks
+    self.attn_scales = attn_scales
+    self.temperal_upsample = temperal_upsample
+
+    if non_linearity == "silu":
+        self.nonlinearity = nn.silu
+    else:
+        from maxdiffusion.models.modeling_flax_utils import get_activation
+        self.nonlinearity = get_activation(non_linearity)
+
+    # dimensions
+    dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
+    scale = 1.0 / 2 ** (len(dim_mult) - 2)
+
+    # init block
+    self.conv_in = WanCausalConv3d(
+        rngs=rngs,
+        in_channels=z_dim,
+        out_channels=dims[0],
+        kernel_size=3,
+        padding=1,
+        mesh=mesh,
+        dtype=dtype,
+        weights_dtype=weights_dtype,
+        precision=precision,
+    )
+
+    # middle_blocks
+    self.mid_block = WanMidBlock(
+        dim=dims[0],\
+        rngs=rngs,
+        dropout=dropout,
+        non_linearity=non_linearity,
+        num_layers=1,
+        mesh=mesh,
+        dtype=dtype,
+        weights_dtype=weights_dtype,
+        precision=precision,
+    )
+
+    # upsample blocks
+    up_blocks = []
+    for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+      # residual (+attention) blocks
+      if i > 0:
+        in_dim = in_dim // 2
+
+      # Determine if we need upsampling
+      upsample_mode = None
+      if i != len(dim_mult) - 1:
+        upsample_mode = "upsample3d" if temperal_upsample[i] else "upsample2d"
+      # Create and add the upsampling block
+      up_block = WanUpBlock(
+          in_dim=in_dim,
+          out_dim=out_dim,
+          num_res_blocks=num_res_blocks,
+          dropout=dropout,
+          upsample_mode=upsample_mode,
+          non_linearity=non_linearity,
+          rngs=rngs,
+          mesh=mesh,
+          dtype=dtype,
+          weights_dtype=weights_dtype,
+          precision=precision,
+      )
+      up_blocks.append(up_block)
+
+      # Update scale for next iteration
+      if upsample_mode is not None:
+        scale *= 2.0
+
+    if hasattr(nnx, 'List'):
+        self.up_blocks = nnx.List(up_blocks)
+    else:
+        self.up_blocks = up_blocks
+
+    # output blocks
+    self.norm_out = WanRMS_norm(dim=out_dim, images=False, rngs=rngs, channel_first=False)
+    self.conv_out = WanCausalConv3d(
+        rngs=rngs,
+        in_channels=out_dim,
+        out_channels=3,
+        kernel_size=3,
+        padding=1,
+        mesh=mesh,
+        dtype=dtype,
+        weights_dtype=weights_dtype,
+        precision=precision,
+    )
+
+WanDecoder3d.__init__ = new_wan_decoder_3d_init
 
 #### SETTINGS
 # 1.3B
@@ -528,15 +983,15 @@ def load_wan_vae_fixed(pretrained_model_name_or_path: str, eval_shapes: dict, de
 
 ### Sharding VAE ###
 
-def _add_sharding_rule(vs: nnx.VariableState, logical_axis_rules) -> nnx.VariableState:
-  vs.sharding_rules = logical_axis_rules
+def _add_sharding_rule(vs: nnx.Variable, logical_axis_rules) -> nnx.Variable:
+  vs.set_metadata(sharding_rules=logical_axis_rules)
   return vs
 
 @nnx.jit(static_argnums=(1,), donate_argnums=(0,))
 def create_sharded_logical_model(model, logical_axis_rules):
   graphdef, state, rest_of_state = nnx.split(model, nnx.Param, ...)
   p_add_sharding_rule = functools.partial(_add_sharding_rule, logical_axis_rules=logical_axis_rules)
-  state = jax.tree.map(p_add_sharding_rule, state, is_leaf=lambda x: isinstance(x, nnx.VariableState))
+  state = jax.tree.map(p_add_sharding_rule, state, is_leaf=lambda x: isinstance(x, nnx.Variable))
   pspecs = nnx.get_partition_spec(state)
   sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
   model = nnx.merge(graphdef, sharded_state, rest_of_state)

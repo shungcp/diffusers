@@ -14,6 +14,16 @@ To run:
 python wan_tx_splash_attn.py
 ```
 
+# Update on TPU7x on 01/23/2026
+
+1. make WAN2.1 with on 7x-8 in 234s, with the previous setting. (check-in)
+
+2. make HunYuanVideo works in low Height/Width with 2.45s/it. (check-in)
+
+| 30/30 [01:13<00:00,  2.45s/it]
+
+3. [in progress] identify the right model to optimize.
+
 # Progress:
 
 ```
