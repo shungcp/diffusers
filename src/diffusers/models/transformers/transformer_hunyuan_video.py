@@ -891,6 +891,12 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
         rope_theta: float = 256.0,
         rope_axes_dim: Tuple[int] = (16, 56, 56),
         image_condition_type: Optional[str] = None,
+        # Hunyuan 1.5 args
+        text_embed_2_dim: Optional[int] = None,
+        image_embed_dim: Optional[int] = None,
+        target_size: Optional[int] = None,
+        task_type: Optional[str] = None,
+        use_meanflow: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1147,3 +1153,10 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
             return (hidden_states,)
 
         return Transformer2DModelOutput(sample=hidden_states)
+
+# Alias for Hunyuan 1.5, which shares the exact same architecture but has different config constraints (supported via __init__)
+class HunyuanVideo15Transformer3DModel(HunyuanVideoTransformer3DModel):
+    pass
+
+
+

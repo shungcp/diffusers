@@ -13,9 +13,6 @@ import jax.numpy as jnp
 import numpy as np
 import os
 
-# CRITICAL: Patch transformers BEFORE importing diffusers/transformers models
-# This avoids vmap/functorch crashes in masking_utils.
-
 # Monkeypatch torchax.ops.jaten._aten_unsafe_view to fix 'order' arg error with wrappers
 try:
     import torchax.ops.jaten as jaten
@@ -35,7 +32,7 @@ try:
             raise e
 
     # Apply patch to module
-    print("DEBUG: Monkeypatching torchax.ops.jaten._aten_unsafe_view for robustness...")
+    #print("DEBUG: Monkeypatching torchax.ops.jaten._aten_unsafe_view for robustness...")
     jaten._aten_unsafe_view = _robust_aten_unsafe_view
     
     # Re-register for dispatch
@@ -88,7 +85,7 @@ try:
         mask = mask[None, None, :, :].expand(bsz, 1, seq_len, seq_len)
         return mask
 
-    print("DEBUG: Monkeypatching transformers.masking_utils.create_causal_mask (PRE-IMPORT) for torchax compatibility...")
+    #print("DEBUG: Monkeypatching transformers.masking_utils.create_causal_mask (PRE-IMPORT) for torchax compatibility...")
     transformers.masking_utils.create_causal_mask = _simple_create_causal_mask
 except ImportError:
     pass
@@ -214,6 +211,10 @@ try:
         cos = jnp.cos(emb)
         sin = jnp.sin(emb)
         
+        # DEBUG: Check for NaNs in Rotary
+        print(f"DEBUG: Rotary Cos Stats: Min: {jnp.min(cos)}, Max: {jnp.max(cos)}")
+        print(f"DEBUG: Rotary Sin Stats: Min: {jnp.min(sin)}, Max: {jnp.max(sin)}")
+        
         # Cast back to input dtype
         target_dtype = x_jax.dtype
         cos = cos.astype(target_dtype)
@@ -224,7 +225,7 @@ try:
         env = getattr(x, 'env', None) or torchax.default_env()
         return torchax.tensor.Tensor(cos, env), torchax.tensor.Tensor(sin, env)
 
-    print("DEBUG: Monkeypatching LlamaRotaryEmbedding.forward for torchax compatibility...")
+    #print("DEBUG: Monkeypatching LlamaRotaryEmbedding.forward for torchax compatibility...")
     LlamaRotaryEmbedding.forward = _robust_llama_rotary_forward
 except ImportError:
     pass
@@ -264,7 +265,7 @@ def _robust_j2t_dtype(dtype):
         return dtype
     return _original_j2t_dtype(dtype)
 torchax.ops.mappings.j2t_dtype = _robust_j2t_dtype
-print("DEBUG: Monkeypatched torchax.ops.mappings.j2t_dtype for robustness.")
+#print("DEBUG: Monkeypatched torchax.ops.mappings.j2t_dtype for robustness.")
 
 # PATCH: torchax.tensor.Tensor.reshape to support JAX 'order' argument
 # JAX's jnp.reshape calls .reshape(shape, order=...) on inputs.
@@ -280,7 +281,7 @@ def _robust_reshape_wrapper(self, *args, **kwargs):
     return _original_reshape(self, *args, **kwargs)
 
 TorchaxTensor.reshape = _robust_reshape_wrapper
-print("DEBUG: Monkeypatched torchax.tensor.Tensor.reshape for JAX compatibility.")
+#print("DEBUG: Monkeypatched torchax.tensor.Tensor.reshape for JAX compatibility.")
 
 # Removed failed monkeypatch attempt
 # Dyanmic patch is now in main()
@@ -447,17 +448,10 @@ def _get_llama_prompt_embeds(
 
         text_input_ids = text_inputs.input_ids
         prompt_attention_mask = text_inputs.attention_mask
-
-        # PATCH: Convert to jax to ensure compatibility with compiled text_encoder
-        # text_input_ids = text_input_ids.to('jax')
-        # prompt_attention_mask = prompt_attention_mask.to('jax')
         
         env = torchax.default_env()
         text_input_ids = env.to_xla(text_input_ids)
         prompt_attention_mask = env.to_xla(prompt_attention_mask)
-        
-        print(f"DEBUG: text_input_ids type: {type(text_input_ids)}")
-        print(f"DEBUG: prompt_attention_mask type: {type(prompt_attention_mask)}")
 
         prompt_embeds = self.text_encoder(
             input_ids=text_input_ids,
@@ -567,7 +561,11 @@ def _tpu_splash_attention(query, key, value, env, scale=None, is_causal=False, w
 # ops_registry.register("splash_attention", _tpu_splash_attention)
 
 # Configuration
-MODEL_ID = "hunyuanvideo-community/HunyuanVideo"
+# Configuration
+# MODEL_ID = "tencent/HunyuanVideo" # Official Repo (likely 13B) - Missing transformer/config.json
+#MODEL_ID = "hunyuanvideo-community/HunyuanVideo" # Community Repo (Diffusers Compatible)
+MODEL_ID = "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
+#MODEL_ID = "Aquiles-ai/HunyuanVideo-1.5-720p-fp8"
 HEIGHT = 720
 WIDTH = 1280
 FRAMES = 61 # Standard for Hunyuan
@@ -599,7 +597,7 @@ def _shard_weight_dict(weight_dict, sharding_dict, mesh):
     else:
       # replicate
       if not hasattr(v, 'apply_jax_'):
-          print(f"Warning: {k} (type: {type(v)}) does not have apply_jax_. Converting on the fly.")
+          #print(f"Warning: {k} (type: {type(v)}) does not have apply_jax_. Converting on the fly.")
           # Convert on the fly
           env = torchax.default_env()
           v = env.to_xla(v)
@@ -613,6 +611,7 @@ def _move_module(module, env):
     # Standard state_dict move for tracked params/buffers
     with jax.default_device('cpu'):
       state_dict  = module.state_dict()
+      state_dict = env.to_xla(state_dict)
       state_dict = env.to_xla(state_dict)
       module.load_state_dict(state_dict, assign=True)
     
@@ -629,7 +628,7 @@ def _move_module(module, env):
              attr_name = path[-1]
              
              # Convert
-             print(f"Manually converting buffer: {name}")
+             #print(f"Manually converting buffer: {name}")
              # We use env.to_xla for consistency
              jax_buf = env.to_xla(buf)
              setattr(parent, attr_name, jax_buf)
@@ -646,6 +645,7 @@ def _get_llama_prompt_embeds(
         num_hidden_layers_to_skip: int = 2,
     ):
         device = device or self._execution_device
+        # SWAP: Use text_encoder (Qwen) dtype
         dtype = dtype or self.text_encoder.dtype
 
         if isinstance(prompt, str):
@@ -656,6 +656,7 @@ def _get_llama_prompt_embeds(
 
         crop_start = prompt_template.get("crop_start", None)
         if crop_start is None:
+            # SWAP: Use tokenizer (Qwen)
             prompt_template_input = self.tokenizer(
                 prompt_template["template"],
                 padding="max_length",
@@ -669,6 +670,7 @@ def _get_llama_prompt_embeds(
             crop_start -= 2
 
         max_sequence_length += crop_start
+        # SWAP: Use tokenizer (Qwen)
         text_inputs = self.tokenizer(
             prompt,
             max_length=max_sequence_length,
@@ -680,17 +682,10 @@ def _get_llama_prompt_embeds(
 
         text_input_ids = text_inputs.input_ids
         prompt_attention_mask = text_inputs.attention_mask
-
-        # PATCH: Convert to jax to ensure compatibility with compiled text_encoder
-        # text_input_ids = text_input_ids.to('jax')
-        # prompt_attention_mask = prompt_attention_mask.to('jax')
         
         env = torchax.default_env()
         text_input_ids = env.to_xla(text_input_ids)
         prompt_attention_mask = env.to_xla(prompt_attention_mask)
-        
-        print(f"DEBUG: text_input_ids type: {type(text_input_ids)}")
-        print(f"DEBUG: prompt_attention_mask type: {type(prompt_attention_mask)}")
 
         prompt_embeds = self.text_encoder(
             input_ids=text_input_ids,
@@ -699,7 +694,7 @@ def _get_llama_prompt_embeds(
         )
         # Use logic from original: hidden_states[-(num_hidden_layers_to_skip + 1)]
         prompt_embeds = prompt_embeds.hidden_states[-(num_hidden_layers_to_skip + 1)]
-        
+ 
         # Crop prompt
         prompt_embeds = prompt_embeds[:, crop_start:]
         prompt_attention_mask = prompt_attention_mask[:, crop_start:]
@@ -774,12 +769,15 @@ def _get_clip_prompt_embeds(
         dtype: Optional[torch.dtype] = None,
         max_sequence_length: int = 77,
     ):
+        import torchax
         device = device or self._execution_device
-        dtype = dtype or self.text_encoder_2.dtype
+        dtype = dtype or self.text_encoder.dtype
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
+        # SWAP: Hunyuan 1.5 Community Repo puts ByT5 (Pooled) at text_encoder_2
+        # So we must use tokenizer_2 and text_encoder_2 here to get 1472 dim.
         text_inputs = self.tokenizer_2(
             prompt,
             padding="max_length",
@@ -791,28 +789,169 @@ def _get_clip_prompt_embeds(
 
         text_input_ids = text_inputs.input_ids
         prompt_attention_mask = text_inputs.attention_mask
-
-        # PATCH: Convert to jax
-        # text_input_ids = text_input_ids.to('jax')
-        # prompt_attention_mask = prompt_attention_mask.to('jax')
         
         env = torchax.default_env()
         text_input_ids = env.to_xla(text_input_ids)
         prompt_attention_mask = env.to_xla(prompt_attention_mask)
 
+        # SWAP: Use text_encoder_2 (ByT5)
+        # ByT5 usually returns (last_hidden_state,) or similar. 
+        # Typically DOES NOT have pooler_output, so we might need to mean pool manually if it returns sequence.
         prompt_embeds = self.text_encoder_2(
             text_input_ids,
             attention_mask=prompt_attention_mask,
             output_hidden_states=False,
+            return_dict=False,
         )
-        prompt_embeds = prompt_embeds.pooler_output
         
-        if dtype:
+        # Confirm expected dimension from transformer weights (Truth)
+        # Confirm expected dimension from transformer weights (Truth)
+        expected_dim = 1024 # Default
+        if hasattr(self, 'transformer'):
+             if hasattr(self.transformer, 'time_text_embed') and \
+                hasattr(self.transformer.time_text_embed, 'text_embedder') and \
+                hasattr(self.transformer.time_text_embed.text_embedder, 'linear_1'):
+                  expected_dim = self.transformer.time_text_embed.text_embedder.linear_1.weight.shape[1]
+                  #print(f"DEBUG: Detected text_embedder expected input dim: {expected_dim}")
+             elif hasattr(self.transformer.config, 'pooled_projection_dim'):
+                  expected_dim = self.transformer.config.pooled_projection_dim
+                  print(f"DEBUG: Using config pooled_projection_dim: {expected_dim}")
+        
+        # Override for Hunyuan 1.5 if detection failed (e.g. 1024) but we know it should be 3584
+        # We can detect this if the input tensor is 1472 (Hunyuan 1.5 CLIP?)
+        # Or just trust the detection if it worked.
+        # But if it defaulted to 1024, we might miss padding 1472 -> 3584.
+        if expected_dim == 1024:
+             # Check if we should actually be 3584
+             if hasattr(self, 'transformer') and getattr(self.transformer.config, 'pooled_projection_dim', 0) == 3584:
+                 expected_dim = 3584
+                 print("DEBUG: Corrected expected_dim to 3584 based on config.")
+
+        # Helper to find tensor by ndim
+        def _find_tensor(tup, ndim):
+            if not isinstance(tup, (tuple, list)):
+                tup = [tup]
+            for i, t in enumerate(tup):
+                dims = None
+                if hasattr(t, 'ndim'): dims = t.ndim
+                elif hasattr(t, 'shape'): dims = len(t.shape)
+                
+                if dims == ndim:
+                    print(f"DEBUG: Found {ndim}D tensor at index {i} with shape {t.shape}")
+                    return t
+            return None
+
+        if expected_dim > 20000:
+            # Need Flattened Sequence
+            target = None
+            if isinstance(prompt_embeds, tuple):
+                target = _find_tensor(prompt_embeds, 3) 
+            else:
+                target = _find_tensor([prompt_embeds], 3)
+            
+            if target is not None:
+                print(f"DEBUG: Found 3D tensor {target.shape}, flattening to match {expected_dim}...")
+                prompt_embeds = target.flatten(1)
+            else:
+                print(f"WARNING: Could not find 3D tensor for flattening! prompt_embeds type: {type(prompt_embeds)}")
+                if isinstance(prompt_embeds, tuple): prompt_embeds = prompt_embeds[0]
+                
+        else:
+            # Need Pooled (2D)
+            target = None
+            if isinstance(prompt_embeds, tuple):
+                 # CLIP return order: (last_hidden_state, pooler_output)
+                 # Try index 1 first as it's usually pooler
+                 if len(prompt_embeds) > 1:
+                      t = prompt_embeds[1]
+                      dims = getattr(t, 'ndim', len(t.shape) if hasattr(t, 'shape') else None)
+                      if dims is not None and dims == 2:
+                           target = t
+                           print("DEBUG: Found 2D tensor at index 1 (likely pooler_output)")
+                 
+                 if target is None:
+                      target = _find_tensor(prompt_embeds, 2)
+            else:
+                 target = _find_tensor([prompt_embeds], 2)
+            
+            if target is not None:
+                prompt_embeds = target
+            else:
+                 three_d = None
+                 if hasattr(prompt_embeds, 'pooler_output'):
+                      prompt_embeds = prompt_embeds.pooler_output
+                 elif hasattr(prompt_embeds, 'text_embeds'):
+                      prompt_embeds = prompt_embeds.text_embeds
+                 else:
+                      if isinstance(prompt_embeds, tuple): 
+                          three_d = prompt_embeds[0]
+                      else:
+                          three_d = prompt_embeds
+                      
+                      # Manually pool: Mean Pooling or standard CLIP EOS pooling?
+                      # Mean pooling is safer if we don't have EOS indices
+                      if hasattr(three_d, 'mean'):
+                           #print("DEBUG: Applying MEAN pooling to 3D tensor")
+                           prompt_embeds = three_d.mean(dim=1)
+                      else:
+                           print("WARNING: Could not pool 3D tensor (no mean method), taking index 0")
+                           prompt_embeds = three_d[:, 0]
+
+        #print(f"DEBUG: Checking Padding logic. expected_dim={expected_dim}, prompt_embeds.shape={prompt_embeds.shape}, type={type(prompt_embeds)}")
+        
+        # Padding Patch for Hunyuan 1.5 (1024 -> 1152 or 3584 or 1472)
+        if expected_dim is not None and prompt_embeds.shape[-1] != expected_dim:
+             if expected_dim > prompt_embeds.shape[-1]:
+                 pad_amt = expected_dim - prompt_embeds.shape[-1]
+                 print(f"DEBUG: Padding prompt_embeds from {prompt_embeds.shape[-1]} to {expected_dim} (pad={pad_amt})")
+                 
+                 # Explicit JAX Padding
+                 jax_arr = None
+                 env = None
+                 if hasattr(prompt_embeds, 'jax'):
+                     jax_arr = prompt_embeds.jax()
+                     env = prompt_embeds.env
+                 elif hasattr(prompt_embeds, '_elem'):
+                     jax_arr = prompt_embeds._elem
+                     env = prompt_embeds.env
+                 
+                 if jax_arr is not None:
+                      print(f"DEBUG: Performing JAX padding on {jax_arr.shape}...")
+                      import jax.numpy as jnp
+                      import torchax
+                      
+                      pad_width = []
+                      for _ in range(len(jax_arr.shape) - 1):
+                           pad_width.append((0, 0))
+                      pad_width.append((0, pad_amt))
+                      
+                      padded_jax = jnp.pad(jax_arr, pad_width)
+                      print(f"DEBUG: JAX Padded shape: {padded_jax.shape}")
+                      
+                      # Wrap back
+                      if env is None: env = torchax.default_env()
+                      prompt_embeds = torchax.tensor.Tensor(padded_jax, env)
+                 else:
+                      print("DEBUG: Could not unwrap to JAX for padding. Trying fallback F.pad...")
+                      import torch.nn.functional as F
+                      if hasattr(prompt_embeds, 'to'): 
+                          prompt_embeds = F.pad(prompt_embeds, (0, pad_amt))
+                      else:
+                          try:
+                             prompt_embeds = F.pad(prompt_embeds, (0, pad_amt))
+                          except Exception as e:
+                             print(f"DEBUG: F.pad failed: {e}")
+
+        #print(f"DEBUG: Final prompt_embeds shape: {prompt_embeds.shape}")
+
+        if dtype and hasattr(prompt_embeds, 'to'):
             prompt_embeds = prompt_embeds.to(dtype=dtype)
 
         # duplicate text embeddings for each generation per prompt
-        prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt)
-        prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, -1)
+        if hasattr(prompt_embeds, 'repeat'):
+            prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt)
+        if hasattr(prompt_embeds, 'view'):
+            prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, -1)
 
         return prompt_embeds
 
@@ -841,18 +980,116 @@ def _patched_transformer_forward(
     **kwargs,
 ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
     
+    # PATCH: Pad channels if needed (32 -> 65 for Hunyuan 1.5)
+    if hidden_states.shape[1] == 32 and self.config.in_channels == 65:
+         # Pad with zeros: (B, 33, T, H, W)
+         pad = torch.zeros(hidden_states.shape[0], 33, *hidden_states.shape[2:], 
+                           device=hidden_states.device, dtype=hidden_states.dtype)
+         hidden_states = torch.cat([hidden_states, pad], dim=1)
+
     batch_size, num_channels, num_frames, height, width = hidden_states.shape
     p, p_t = self.config.patch_size, self.config.patch_size_t
     post_patch_num_frames = num_frames // p_t
     post_patch_height = height // p
     post_patch_width = width // p
     first_frame_num_tokens = 1 * post_patch_height * post_patch_width
+    
+    # DEBUG: Check stats using jax.debug.print
+    def _print_stats(name, t):
+        import jax
+        import jax.numpy as jnp
+        
+        def _log_one(n, x):
+            if x is None:
+                 print(f"DEBUG RT: {n} is None")
+                 return
+            # Unwrap TorchaxTensor
+            if hasattr(x, 'jax'): x = x.jax()
+            elif hasattr(x, '_elem'): x = x._elem
+            
+            # Robust dtype check
+            is_int_or_bool = False
+            if hasattr(x, 'dtype'):
+                d_str = str(x.dtype)
+                if 'int' in d_str or 'bool' in d_str:
+                    is_int_or_bool = True
+            
+            # Helper to get values
+            try:
+                # If it's a Torch tensor, convert to numpy/jax for printing if possible, or use torch ops
+                # But we want jax.debug.print during tracing.
+                # If x is a Torch Tensor during JAX tracing, it might be a problem if it's not a Tracer.
+                # Assuming x is compatible interacting with JAX here (Torchax guarantees this mostly).
+                
+                if is_int_or_bool:
+                     jax.debug.print(f"DEBUG RT: {n} (Int/Bool) - Min: {{min}}, Max: {{max}}", 
+                                    min=jnp.min(x), max=jnp.max(x))
+                else:
+                     jax.debug.print(f"DEBUG RT: {n} stats - Min: {{min}}, Max: {{max}}, Mean: {{mean}}, IsNaN: {{nan}}", 
+                                    min=jnp.min(x), max=jnp.max(x), mean=jnp.mean(x), nan=jnp.any(jnp.isnan(x)))
+            except Exception as e:
+                # Fallback if something weird happens (e.g. mix of frameworks)
+                print(f"DEBUG RT: Could not print stats for {n}: {e}")
+
+        if isinstance(t, tuple):
+             for i, item in enumerate(t):
+                 _log_one(f"{name}[{i}]", item)
+        else:
+             _log_one(name, t)
+
+    #_print_stats("SiT Input TimeStep", timestep)
+    #_print_stats("SiT Input Pooled Proj", pooled_projections)
+    #_print_stats("SiT Input Guidance", guidance)
+    
+    # PATCH: Fix Guidance explosion (1e29)
+    # Pipeline passes guidance * 1000 (e.g. 6000), but generic/V1 transformer might expect ~6.
+    # We use pure JAX to avoid torchax operator bugs (AttributeError during trace)
+    if guidance is not None:
+         # Unwrap to JAX array
+         g_jax = guidance.jax()
+         
+         # Compute safe guidance in JAX
+         import jax.numpy as jnp
+         # Use 0.001 multiplication to be safe, though JAX handles division fine.
+         # Condition must be on the JAX array.
+         cond = jnp.mean(g_jax) > 100
+         g_rescaled = jnp.where(cond, g_jax * 0.001, g_jax)
+         
+         # Wrap back to Torchax Tensor
+         # We need the environment. Input tensors might not expose .env, so use default_env()
+         guidance = torchax.tensor.Tensor(g_rescaled, torchax.default_env())
+         
+         #_print_stats("SiT Input Guidance (Processed)", guidance)
 
     # 1. RoPE
     image_rotary_emb = self.rope(hidden_states)
+    
+    # DEBUG: Check stats using jax.debug.print for Tracers
+    def _print_stats(name, t):
+        import jax
+        import jax.numpy as jnp
+        
+        def _log_one(n, x):
+            # Unwrap TorchaxTensor if present
+            if hasattr(x, 'jax'): 
+                x = x.jax()
+            elif hasattr(x, '_elem'):
+                x = x._elem
+            
+            # Print at runtime
+            jax.debug.print(f"DEBUG RT: {n} stats - Min: {{min}}, Max: {{max}}, Mean: {{mean}}, IsNaN: {{nan}}", 
+                            min=jnp.min(x), max=jnp.max(x), mean=jnp.mean(x), nan=jnp.any(jnp.isnan(x)))
+
+        if isinstance(t, tuple):
+             for i, item in enumerate(t):
+                 _log_one(f"{name}[{i}]", item)
+        else:
+             _log_one(name, t)
 
     # 2. Conditional embeddings
     temb, token_replace_emb = self.time_text_embed(timestep, pooled_projections, guidance)
+    
+    #_print_stats("SiT Time/Text Emb", temb)
 
     hidden_states = self.x_embedder(hidden_states)
     encoder_hidden_states = self.context_embedder(encoder_hidden_states, timestep, encoder_attention_mask)
@@ -881,6 +1118,33 @@ def _patched_transformer_forward(
     
     # Ensure bool
     attention_mask = attention_mask.to(torch.bool)
+
+
+
+    # Monkeypatch HunyuanVideoConditionEmbedding to inspect components
+    from diffusers.models.transformers.transformer_hunyuan_video import HunyuanVideoConditionEmbedding
+    
+    def _patched_time_text_embed_forward(self, timestep, pooled_projections, guidance=None):
+        # 1. Timestep
+        timesteps_proj = self.timestep_embedder(timestep) 
+        # Debug
+        #_print_stats("SiT Inner Timestep Proj", timesteps_proj)
+        
+        # 2. Pooled
+        pooled_projections = self.text_embedder(pooled_projections)
+        #_print_stats("SiT Inner Pooled Proj", pooled_projections)
+        
+        conditioning = timesteps_proj + pooled_projections
+
+        # 3. Guidance
+        if self.guidance_embedder is not None and guidance is not None:
+            guidance_emb = self.guidance_embedder(guidance)
+            #_print_stats("SiT Inner Guidance Emb", guidance_emb)
+            conditioning = conditioning + guidance_emb
+            
+        return conditioning, pooled_projections
+
+    HunyuanVideoConditionEmbedding.forward = _patched_time_text_embed_forward
 
     # 4. Transformer blocks
     if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -1142,6 +1406,9 @@ class HunyuanSplashAttnProcessor(torch.nn.Module):
 
         return hidden_states, encoder_hidden_states
 
+
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", type=str, default=MODEL_ID)
@@ -1152,24 +1419,263 @@ def main():
     parser.add_argument("--prompt", type=str, default="A cat walks on the grass, realistic")
     # Add profile argument
     parser.add_argument("--profile", action="store_true", default=False)
+    parser.add_argument("--fp8", action="store_true", default=False, help="Use FP8 quantized weights")
     args = parser.parse_args()
 
-    print(f"Initializing HunyuanVideoPipeline with model: {args.model_id}")
+    # Separate IDs for Transformer and VAE to handle FP8 split sources
+    transformer_model_id = args.model_id
+    transformer_subfolder = "transformer"
+    vae_model_id = args.model_id
+    vae_subfolder = "vae"
 
-    # Load Pipeline (Load BEFORE enabling torchax to avoid safetensors/UntypedStorage issues)
-    # Using float32 for loading to avoid precision issues before moving to JAX/BF16 if needed
-    transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-        args.model_id, subfolder="transformer", torch_dtype=torch.float32
-    )
-    vae = AutoencoderKLHunyuanVideo.from_pretrained(
-        args.model_id, subfolder="vae", torch_dtype=torch.float32
-    )
+    if args.fp8:
+        # Override Transformer source to Aquiles-ai (Files at ROOT)
+        transformer_model_id = "Aquiles-ai/HunyuanVideo-1.5-720p-fp8"
+        transformer_subfolder = None # Config is at root in this repo
+        
+        # Keep VAE from the original/community source
+        if args.model_id == MODEL_ID or args.model_id == transformer_model_id:
+            # If user didn't specify a custom base, use the community one for VAE
+            vae_model_id = MODEL_ID 
+        
+        print(f"FP8 Mode: Loading Transformer from {transformer_model_id} (root)")
+        print(f"FP8 Mode: Loading VAE from {vae_model_id} ({vae_subfolder})")
+
+    # Load Pipeline
+    import diffusers
+    import transformers
+    
+    # Suppress warnings
+    diffusers.utils.logging.set_verbosity_error()
+    transformers.logging.set_verbosity_error()
+    
+    if not args.fp8:
+         pipe = HunyuanVideoPipeline.from_pretrained(args.model_id, torch_dtype=torch.float16)
+    else:
+         # FP8 Pipeline Loading
+         # We load the standard pipeline first (CPU, float32/16)
+         # Then we swap the transformer.
+         # Ideally we want to load ONLY the components we need to save RAM, but...
+         
+         # Load with float32 to avoid issues, we move to BF16 later
+         # use_safetensors=True is default.
+         pipe = HunyuanVideoPipeline.from_pretrained(args.model_id, torch_dtype=torch.float32)
+
+    # Restore default logging if needed, or keep quiet
+    # diffusers.utils.logging.set_verbosity_info()
+
+    transformer_weight_name = None
+    if args.fp8:
+         from huggingface_hub import hf_hub_download
+         transformer_weight_name = "quantized/hy15_720p_t2v_fp8_e4m3_lightx2v.safetensors"
+         
+         print(f"DEBUG: Explicitly downloading FP8 weights: {transformer_weight_name} from {transformer_model_id}...")
+         try:
+             # 1. Download Weights
+             weight_path = hf_hub_download(
+                 repo_id=transformer_model_id,
+                 filename=transformer_weight_name,
+                 subfolder=transformer_subfolder
+             )
+             print(f"DEBUG: Found/Downloaded FP8 weights at: {weight_path}")
+
+             # 2. Use MAPPED Config (Generated by map_config.py)
+             # We need to map the Aquiles keys (heads_num) to Diffusers keys (num_attention_heads)
+             config_path = "hunyuan_fp8_transformer_link/mapped_config.json"
+             
+             if not os.path.exists(config_path):
+                 raise RuntimeError(f"Mapped config not found at {config_path}. Please run 'python map_config.py' first!")
+                 
+             print(f"DEBUG: Using Mapped Config at: {config_path}")
+
+             # 3. Use from_single_file which handles ComfyUI/LightX key mapping automatically
+             print(f"DEBUG: Loading transformer using from_single_file...")
+             # DEBUG: Print raw keys from file to debug mapping
+             try:
+                 import safetensors.torch
+                 raw_sd = safetensors.torch.load_file(weight_path)
+                 # print("DEBUG: Raw Checkpoint Keys (First 50):")
+                 # for i, k in enumerate(list(raw_sd.keys())[:50]):
+                 #     print(f"  {k}")
+             except Exception as e:
+                 print(f"DEBUG: Could not read raw keys: {e}")
+
+             # MANUAL LOADING REPLACEMENT
+             print("DEBUG: Switching to MANUAL LOADING to bypass meta/mapping issues...")
+             import json
+             import safetensors.torch
+             import copy
+             
+             # 1. Load Config
+             with open(config_path, 'r') as f:
+                 config_dict = json.load(f)
+
+             if args.fp8:
+                 #print("DEBUG: Manually forcing pooled_projection_dim=1472 within manual config load to match ByT5 weights")
+                 config_dict["pooled_projection_dim"] = 1472
+             
+             # 2. Init Model (on CPU, force dense tensors)
+             #print("DEBUG: Instantiating model on CPU...")
+             # Remove keys that might confuse __init__ if necessary (usually from_config handles this)
+             # We use direct __init__ so we must clean extra keys if any
+             # But map_config.py ensures keys are from ref_conf mostly.
+             try:
+                 # Filter keys to match __init__ signature if possible? 
+                 # Or just try/except. 
+                 # A safer way is using the class method that handles config
+                 # Use the modified config_dict
+                 transformer = HunyuanVideoTransformer3DModel.from_config(config_dict)
+             except Exception as e:
+                 #print(f"DEBUG: from_config failed ({e}), trying kwargs init...")
+                 transformer = HunyuanVideoTransformer3DModel(**config_dict)
+                 
+             transformer.eval() 
+             
+             # 3. Load Weights
+             #print(f"DEBUG: Loading weights from {weight_path}")
+             raw_sd = safetensors.torch.load_file(weight_path)
+             
+             # 4. Remap Keys (time_embed -> time_text_embed, etc.)
+             #print("DEBUG: Remapping keys manually...")
+             new_sd = {}
+             for k, v in raw_sd.items():
+                 new_k = k
+                 if k.startswith("time_embed."):
+                     new_k = k.replace("time_embed.", "time_text_embed.")
+                 elif k.startswith("context_embedder_2."):
+                      new_k = k.replace("context_embedder_2.", "time_text_embed.text_embedder.")
+                 elif k.startswith("byt5_in."):
+                       new_k = k.replace("byt5_in.", "time_text_embed.text_embedder.")
+                 elif k.startswith("txt_in.c_embedder."): # Found in FP8 checkpoint - Context/Sequence Embedder
+                       new_k = k.replace("txt_in.c_embedder.", "context_embedder.time_text_embed.text_embedder.")
+                 elif k.startswith("txt_in.t_embedder."): # Found in FP8 checkpoint
+                       new_k = k.replace("txt_in.t_embedder.", "context_embedder.time_text_embed.timestep_embedder.")
+                 # Remap image_embedder? User execution earlier showed 'image_embedder' unused.
+                 # If model doesn't use it, ignore.
+                 
+                 new_sd[new_k] = v
+             
+             #print("DEBUG: Successfully loaded transformer via MANUAL path.")
+             # Skip standard loading below
+             transformer_model_id = None
+             #print("DEBUG: Successfully loaded transformer via from_single_file.")
+             
+             # MANUAL PATCH: Remap keys if time_text_embed is zero
+             # Based on user logs: unused 'time_embed.timestep_embedder...' vs missing 'time_text_embed.timestep_embedder...'
+             # It seems the checkpoint uses 'time_embed' but the model uses 'time_text_embed'
+             # Also 'context_embedder_2' vs ??? 
+             
+             #print("DEBUG: Checking for remapping needs...")
+             if hasattr(transformer, 'time_text_embed'):
+                 # Check if linear_1 weight is zero
+                 if isinstance(transformer.time_text_embed.timestep_embedder.linear_1.weight, torch.Tensor) and \
+                    (transformer.time_text_embed.timestep_embedder.linear_1.weight == 0).all():
+                     
+                     #print("DEBUG: Detected ZERO weights in time_text_embed. Attempting manual remapping from loaded state dict...")
+                     # We need to reload the state dict from the file manually to get the unused keys
+                     # Or rely on what we just loaded if we can get it. 
+                     # Actually from_single_file returns the model. We can't easily access the unused keys from it directly 
+                     # unless we capture the output of load_state_dict which is internal.
+                     
+                     # Better approach: Load raw state dict, remap keys, load into model.
+                     import safetensors.torch
+                     raw_sd = safetensors.torch.load_file(weight_path)
+                     
+                     new_sd = {}
+                     count = 0
+                     for k, v in raw_sd.items():
+                         new_k = k
+                         # Mapping rules
+                         if k.startswith("time_embed."):
+                             new_k = k.replace("time_embed.", "time_text_embed.")
+                         elif k.startswith("context_embedder_2."):
+                             # context_embedder_2 -> time_text_embed.text_embedder ??
+                             # User logs show 'context_embedder_2.linear_1.weight' unused.
+                             # Model has 'time_text_embed.text_embedder.linear_1.weight' zero.
+                             # Let's map context_embedder_2 -> time_text_embed.text_embedder
+                             new_k = k.replace("context_embedder_2.", "time_text_embed.text_embedder.")
+                         
+                         if new_k != k:
+                             print(f"  Remapping {k} -> {new_k}")
+                             count += 1
+                         new_sd[new_k] = v
+                     
+                     if count > 0:
+                         print(f"DEBUG: Applying {count} remapped keys...")
+                         m, u = transformer.load_state_dict(new_sd, strict=False)
+                         print(f"DEBUG: Reloaded. Missing keys: {len(m)}, Unexpected keys: {len(u)}")
+             
+             #print("DEBUG: Successfully loaded transformer via from_single_file.")
+             
+             # Skip standard loading below
+             transformer_model_id = None 
+
+         except Exception as e:
+             print(f"CRITICAL ERROR: Failed to prepare/load FP8 weights: {e}")
+             raise e
+
+    if transformer_model_id is not None:
+        # Hunyuan 1.5 specific projection dim
+        pooled_projection_dim = 113344 if "1.5" in transformer_model_id else None
+        
+        load_kwargs = {
+            "subfolder": transformer_subfolder,
+            "torch_dtype": torch.bfloat16,
+            "use_safetensors": True,
+            "weight_name": transformer_weight_name,
+            "low_cpu_mem_usage": False,
+        }
+        if pooled_projection_dim:
+             load_kwargs["pooled_projection_dim"] = pooled_projection_dim
+
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(
+            transformer_model_id, 
+            **load_kwargs
+        )
+
+    try:
+
+        if args.fp8:
+             # Download FP8 VAE config and weights
+             print(f"FP8 Mode: Downloading VAE from {transformer_model_id}...")
+             vae_config_path = hf_hub_download(repo_id=transformer_model_id, filename="config.json", subfolder="vae")
+             vae_weight_path = hf_hub_download(repo_id=transformer_model_id, filename="diffusion_pytorch_model.safetensors", subfolder="vae")
+             
+             print(f"DEBUG: Loading VAE from downloaded path: {os.path.dirname(vae_config_path)}")
+             vae = AutoencoderKLHunyuanVideo.from_pretrained(
+                 os.path.dirname(vae_config_path),
+                 torch_dtype=torch.bfloat16,
+             )
+             # Force latent channels if needed (Hunyuan 1.5 is 32)
+             if "1.5" in transformer_model_id:
+                  vae.config.latent_channels = 32
+        
+        elif "HunyuanVideo-1.5" in vae_model_id:
+             # Now utilizing native support in Diffusers (updated AutoencoderKLHunyuanVideo)
+             vae = AutoencoderKLHunyuanVideo.from_pretrained(
+                 vae_model_id, 
+                 subfolder=vae_subfolder, 
+                 torch_dtype=torch.bfloat16,
+                 low_cpu_mem_usage=False,
+             )
+             if "1.5" in vae_model_id:
+                 #print("DEBUG: Forcing VAE latent_channels=32 for Hunyuan 1.5")
+                 vae.config.latent_channels = 32
+        else:
+             vae = AutoencoderKLHunyuanVideo.from_pretrained(
+                vae_model_id, subfolder=vae_subfolder, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False
+            )
+    except Exception as e:
+        print(f"Fallback to standard VAE loading failed: {e}")
+        vae = AutoencoderKLHunyuanVideo.from_pretrained(
+            vae_model_id, subfolder=vae_subfolder, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False
+        )
     
     pipe = HunyuanVideoPipeline.from_pretrained(
         args.model_id, 
         transformer=transformer, 
         vae=vae,
-        torch_dtype=torch.float32
+        torch_dtype=torch.bfloat16
     )
 
     # PATCH: torchax.ops.jaten._aten_convolution robustness
@@ -1208,7 +1714,7 @@ def main():
         if hasattr(ops_registry, 'all_torch_functions'):
             registries.append(ops_registry.all_torch_functions)
             
-        print(f"DEBUG: Found {len(registries)} registries in ops_registry.")
+        #print(f"DEBUG: Found {len(registries)} registries in ops_registry.")
 
         for reg in registries:
             # It's likely a dict or list
@@ -1216,25 +1722,20 @@ def main():
                 items = reg.items()
             else:
                 # If it's a list? unlikely but possible
-                print(f"DEBUG: Registry is type {type(reg)}, skipping iteration.")
+                #print(f"DEBUG: Registry is type {type(reg)}, skipping iteration.")
                 continue
 
             for op, entry in items:
                 op_str = str(op)
                 if "convolution" in op_str or "conv3d" in op_str:
-                    print(f"DEBUG: Patching op: {op_str} in registry")
+                    #print(f"DEBUG: Patching op: {op_str} in registry")
                     # entry is likely an Operator object with .func
                     if hasattr(entry, 'func'):
                         entry.func = _robust_aten_convolution
                         count += 1
                     else:
                         print(f"DEBUG: Warning - Entry for {op_str} has no .func attribute")
-                
-        if count > 0:
-            print(f"DEBUG: Successfully brute-force patched {count} convolution ops in registries.")
-        else:
-            print("DEBUG: WARNING: Could not find any convolution ops in any registry to patch!")
-            
+                          
     except Exception as e:
         print(f"DEBUG: Failed to patch _aten_convolution: {e}")
 
@@ -1347,26 +1848,34 @@ def main():
                 return _original_env_to_copy(self, the_tensor, dtype, device, *args, **kwargs)
              
              EnvClass._to_copy = _robust_env_to_copy
-             print("DEBUG: Successfully patched EnvClass._to_copy for runtime robustness.")
+             #print("DEBUG: Successfully patched EnvClass._to_copy for runtime robustness.")
              
     except Exception as e:
         print(f"DEBUG: Failed to patch Environment class: {e}")
 
     env = torchax.default_env()
+    
+    # DEBUG: Check for meta parameters
+    #print("DEBUG: Checking transformer parameter devices...")
+    has_meta = False
+    count = 0
+    for n, p in transformer.named_parameters():
+        if p.device.type == "meta":
+            if count < 5:
+                 print(f"WARNING: Parameter {n} is on META device! (Not loaded correctly)")
+            count += 1
+            has_meta = True
+            # unexpected key mismatch or loading issue
 
     # TPU Mesh Setup
     n_devices = len(jax.devices())
-    devices = mesh_utils.create_device_mesh((1, (n_devices))) # Use all devices
+    # PERF: Revert to 1x8 Mesh (sp=8) for max memory bandwidth. 
+    # dp=2 (2x4) caused slowdown (2.46s -> 7s) due to reduced model parallelism efficiency.
+    # While dp=2 is conceptually "correct" for CFG, sp=8 is physically FASTER for this model size/batch.
+    devices = mesh_utils.create_device_mesh((1, n_devices))
     mesh = Mesh(devices, axis_names=('dp', 'sp'))
     env.default_device_or_sharding = NamedSharding(mesh, P())
     env._mesh = mesh
-    
-    # Replace Attention Processor
-    print("Replacing attention processor with Splash Attention...")
-    # We need to walk the model and replace processors
-    # Hunyuan transformer uses 'attn1' usually? 
-    # Let's check structure. It has transformer_blocks and single_transformer_blocks.
-    # Each block has 'attn'.
     
     # Simple recursive replacement or iterating known modules
     replacement_processor = HunyuanSplashAttnProcessor(
@@ -1383,47 +1892,60 @@ def main():
                  replace_processor(child)
                  
     replace_processor(pipe.transformer)
-    print("DEBUG: Splash Attention ENABLED.")
-
-    # Compilation & Sharding
-    print("Compiling modules with torchax...")
-    
-    # Text Encoders
-    # Hunyuan has text_encoder (Llama) and text_encoder_2 (CLIP)
-    # We need to move/compile them to avoid mixed tensor errors
     
     text_encoder_options = torchax.CompileOptions(
         jax_jit_kwargs={'static_argnames': ('output_hidden_states', 'return_dict', 'use_cache')}
     )
 
-    # Text Encoder 1 (Llama)
-    print("Compiling text_encoder (Llama)...")
+    # Text Encoder 1 (Llama/Qwen)
+    print("Moving text_encoder (Llama/Qwen) to environment (FP32)...")
+    torchax.disable_globally()
+    try:
+        pipe.text_encoder.to(dtype=torch.float32) # Force FP32 for stability
+    finally:
+        torchax.enable_globally()
     _move_module(pipe.text_encoder, env)
-    pipe.text_encoder = torchax.compile(pipe.text_encoder, text_encoder_options)
+    # pipe.text_encoder = torchax.compile(pipe.text_encoder, text_encoder_options)
     
-    # Text Encoder 2 (CLIP)
-    print("Compiling text_encoder_2 (CLIP)...")
+    # Text Encoder 2 (CLIP/T5)
+    print("Moving text_encoder_2 (CLIP/T5) to environment (FP32)...")
+    torchax.disable_globally()
+    try:
+        pipe.text_encoder_2.to(dtype=torch.float32) # Force FP32 for stability
+    finally:
+        torchax.enable_globally()
     _move_module(pipe.text_encoder_2, env)
-    pipe.text_encoder_2 = torchax.compile(pipe.text_encoder_2, text_encoder_options)
+    # pipe.text_encoder_2 = torchax.compile(pipe.text_encoder_2, text_encoder_options)
 
-    # VAE
-    print("Compiling vae...")
-    # Check if VAE needs specific compile options. wan_tx compiled 'decode'.
-    # Hunyuan VAE might need 'decode' too.
-    # FIX: 'return_dict' determines output format and control flow, so it MUST be static.
-    vae_options = torchax.CompileOptions(
-        methods_to_compile=['decode'],
-        jax_jit_kwargs={'static_argnames': ('return_dict',)}
-    )
-    _move_module(pipe.vae, env)
-    pipe.vae = torchax.compile(pipe.vae, vae_options)
+    # VAE (Replaced with Native JAX VAE to fix OOM)
+    # print("Compiling vae...")
+    # ... (Refer to diff for removal/commenting of old torchax logic)
     
-    # Transformer
+    print("Loading Native JAX VAE (Fixing OOM)...")
+    from hunyuan_vae_jax import load_hunyuan_vae_jax
+    
+    # Load JAX VAE
+    # We use the same model ID.
+    # If explicit path available (from FP8 download), we need to adapt for load_hunyuan_vae_jax
+    # load_hunyuan_vae_jax takes (pretrained_model_name_or_path, subfolder="vae")
+    # If we have a direct file path, we can pass the directory as path and "" as subfolder.
+    
+    vae_id_to_use = vae_model_id
+    vae_subfolder_to_use = "vae"
+    
+    if 'vae_weight_path' in locals() and vae_weight_path is not None:
+         vae_id_to_use = os.path.dirname(vae_weight_path)
+         vae_subfolder_to_use = "" # File is directly in this dir
+         
+    jax_vae = load_hunyuan_vae_jax(vae_id_to_use, subfolder=vae_subfolder_to_use, dtype=jnp.bfloat16, mesh=mesh)
+    print("Native JAX VAE Loaded.")
+    
+    # Disable PyTorch VAE in pipeline to save memory/confusion? 
+    # Actually pipe.vae is still needed for configuration validation inside invoke, 
+    # but we won't use it for decode.
+    
+    # Transformer compilation (Keep as is)
     print("Compiling transformer...")
-    # Hunyuan transformer forward signature:
-    # forward(hidden_states, timestep, encoder_hidden_states, ...)
-    # We might need to handle static args if any.
-    # For now, let's try default compilation.
     _move_module(pipe.transformer, env)
     
     transformer_options = torchax.CompileOptions(
@@ -1431,54 +1953,28 @@ def main():
     )
     pipe.transformer = torchax.compile(pipe.transformer, transformer_options)
 
-    # Debug Recompilation: Wrap the compiled transformer
-    _compiled_transformer_forward = pipe.transformer.forward
-    def debug_transformer_forward(*args, **kwargs):
-        # Inspect types of key inputs
-        # args[0] is usually hidden_states (Tensor)
-        # args[1] might be timestep? Or use kwargs.
-        
-        # Log minimal info to avoid spam, but enough to see changes
-        msg = "DEBUG TX CALL: "
-        for i, arg in enumerate(args):
-            if hasattr(arg, 'shape'):
-                 msg += f"Arg{i}:{type(arg)} shape={arg.shape} id={id(arg)} | "
-            elif isinstance(arg, (int, float)):
-                 msg += f"Arg{i}:{type(arg)} val={arg} | "
-            else:
-                 msg += f"Arg{i}:{type(arg)} | "
-        
-        for k, v in kwargs.items():
-             if hasattr(v, 'shape'):
-                  msg += f"K_{k}:{type(v)} shape={v.shape} id={id(v)} | "
-             elif isinstance(v, (int, float)):
-                  msg += f"K_{k}:{type(v)} val={v} | "
-             else:
-                  msg += f"K_{k}:{type(v)} | "
-        
-        print(msg)
-        return _compiled_transformer_forward(*args, **kwargs)
-    
-    pipe.transformer.forward = debug_transformer_forward
-    # pipe.transformer is a TorchaxWrapper, so modifying forward instance method might work 
-    # if it delegates. If not, we wrapper the object.
-    # Actually, pipe.transformer is the wrapper. 
-    # .forward is the method.
-    # We can assign to the instance.
-
-    
+    # Verify Config matches User Request ("HYVideo-T/2-cfgdistill")
+    config = pipe.transformer.config
+    d_model = config.num_attention_heads * config.attention_head_dim
+    print(f"Hidden Size (calc): {d_model}")
+    print(f"Num Heads: {config.num_attention_heads}")
+   
     # Apply Sharding (Manual)
-    print("Applying sharding rules...")
     if hasattr(pipe.transformer, 'params'):
+            # Define Sharding Rules (Recovered from previous optimization)
+            # 2D+ weights: Shard dim 1 (Input Channels) on 'sp' -> (None, 'sp')
+            # 1D weights: Replicate -> (None,)
+            transformer_shardings = {}
+            for name, param in pipe.transformer.named_parameters():
+                 if param.ndim >= 2:
+                      transformer_shardings[name] = (None, 'sp')
+                 else:
+                      transformer_shardings[name] = (None,)
+                      
+            print("Applying transformer sharding rules...")
             pipe.transformer.params = _shard_weight_dict(pipe.transformer.params, transformer_shardings, mesh)
-            pipe.transformer.buffers = _shard_weight_dict(pipe.transformer.buffers, transformer_shardings, mesh)
-    
-    if hasattr(pipe.vae, 'params'):
-            pipe.vae.params = _shard_weight_dict(pipe.vae.params, vae_shardings, mesh)
-            pipe.vae.buffers = _shard_weight_dict(pipe.vae.buffers, vae_shardings, mesh)
-            
-    # Also shard/replicate text encoders
-    # For now, just replicate (empty sharding dict)
+            pipe.transformer.buffers = _shard_weight_dict(pipe.transformer.buffers, transformer_shardings, mesh) 
+
     if hasattr(pipe.text_encoder, 'params'):
             pipe.text_encoder.params = _shard_weight_dict(pipe.text_encoder.params, {}, mesh)
             pipe.text_encoder.buffers = _shard_weight_dict(pipe.text_encoder.buffers, {}, mesh)
@@ -1487,90 +1983,65 @@ def main():
             pipe.text_encoder_2.params = _shard_weight_dict(pipe.text_encoder_2.params, {}, mesh)
             pipe.text_encoder_2.buffers = _shard_weight_dict(pipe.text_encoder_2.buffers, {}, mesh)
 
-    # Monkeypatch scheduler.step to debug type mismatch
+    # Monkeypatch scheduler.step (Keep as is)
     original_step = pipe.scheduler.step
     def debug_step(model_output, timestep, sample, return_dict=True, generator=None):
         try:
             return original_step(model_output, timestep, sample, return_dict=return_dict, generator=generator)
-        except Exception as e: # Catch TypeError and AssertionError
+        except Exception as e: 
             print(f"Caught error in scheduler step: {e}. Falling back to CPU with global disable.")
-            
-            # Helper to move to cpu and strip wrappers
             def to_cpu_pure(t):
                 if hasattr(t, 'numpy'):
-                    try:
-                        return torch.as_tensor(t.detach().numpy())
-                    except:
-                        pass
-                if hasattr(t, 'cpu'):
-                    return t.cpu()
+                    try: return torch.as_tensor(t.detach().numpy())
+                    except: pass
+                if hasattr(t, 'cpu'): return t.cpu()
                 return torch.as_tensor(t, device='cpu')
 
-            # We MUST disable globally to stop Torchax from intercepting CPU tensor operations
             torchax.disable_globally()
             try:
-                # Convert inputs to pure CPU tensors
                 model_output_cpu = to_cpu_pure(model_output)
                 sample_cpu = to_cpu_pure(sample)
                 timestep_cpu = to_cpu_pure(timestep) if torch.is_tensor(timestep) else timestep
                 
-                print(f"DEBUG: model_output_cpu shape: {model_output_cpu.shape}")
-                print(f"DEBUG: sample_cpu shape: {sample_cpu.shape}")
-                
-                # Check for shape mismatch and reshape if element counts match
                 if model_output_cpu.numel() == sample_cpu.numel() and model_output_cpu.shape != sample_cpu.shape:
-                    print(f"DEBUG: Reshaping model_output_cpu from {model_output_cpu.shape} to {sample_cpu.shape}")
-                    
-                    # Heuristic: if last dim is 2 and we need to merge it into height (dim -2?)
-                    # Current: [1, 256, 45, 160, 2] -> Target: [1, 16, 16, 90, 160] (B, C, T, H, W)
-                    # 45 * 2 = 90. 160 = 160.
-                    # We have [..., H/2, W, 2]. We need [..., H, W].
-                    # So we need to bring '2' next to 'H/2'.
-                    # [..., 45, 160, 2] -> permute(..., 45, 2, 160) -> reshape(..., 90, 160)
                     if model_output_cpu.shape[-1] == 2 and model_output_cpu.shape[-2] == sample_cpu.shape[-1]:
-                         print("DEBUG: Applying permute(0, 1, 2, 4, 3) to fix spatial layout.")
                          model_output_cpu = model_output_cpu.permute(0, 1, 2, 4, 3)
-                    
                     model_output_cpu = model_output_cpu.reshape(sample_cpu.shape)
 
-                
-                # Sanitize scheduler state (sigmas, etc) which might be TorchaxTensors
-                # Access scheduler instance via bound method
-                scheduler_instance = original_step.__self__
-                for k, v in scheduler_instance.__dict__.items():
-                     if torch.is_tensor(v): 
-                        # Check if it looks like a TorchaxTensor (via string check or type)
-                        # or just blindly convert all to CPU pure tensor
-                        if "torchax" in str(type(v)) or hasattr(v, 'env'):
-                             try:
-                                setattr(scheduler_instance, k, to_cpu_pure(v))
-                             except Exception:
-                                pass
+                model_output_cpu = to_cpu_pure(model_output_cpu)
+                timestep_cpu = to_cpu_pure(timestep_cpu)
+                sample_cpu = to_cpu_pure(sample_cpu)
 
-                # Try running step
+                scheduler_instance = original_step.__self__
+                for k in dir(scheduler_instance):
+                     if k.startswith("__"): continue
+                     try: v = getattr(scheduler_instance, k)
+                     except: continue
+                     if torch.is_tensor(v) or (hasattr(v, 'shape') and hasattr(v, 'dtype')): 
+                        if "torchax" in str(type(v)) or hasattr(v, 'env') or (torch.is_tensor(v) and v.device.type != 'cpu'):
+                             try: setattr(scheduler_instance, k, to_cpu_pure(v))
+                             except Exception: pass
+                
+                if hasattr(scheduler_instance, 'sigmas'):
+                    scheduler_instance.sigmas = to_cpu_pure(scheduler_instance.sigmas)
+                if hasattr(scheduler_instance, 'timesteps'):
+                    scheduler_instance.timesteps = to_cpu_pure(scheduler_instance.timesteps)
+
                 res = original_step(model_output_cpu, timestep_cpu, sample_cpu, return_dict=return_dict, generator=generator)
                 
             finally:
-                # Re-enable globally
                 torchax.enable_globally()
             
-            # Convert result back to JAX/TPU
             if 'res' in locals():
-                 print(f"DEBUG: Step finished. Output type: {type(res)}")
-                 
                  env = torchax.default_env()
-                 
                  def to_jax_recursive_final(obj):
                     if torch.is_tensor(obj):
                          if obj.device.type == 'cpu':
                              try:
-                                 # Bridge via Numpy -> JAX -> Torchax
-                                 # output of .numpy() is numpy array
                                  np_val = obj.detach().numpy()
                                  jax_val = jnp.array(np_val)
                                  return torchax.tensor.Tensor(jax_val, env)
                              except Exception as e:
-                                 print(f"DEBUG: Failed to wrap output tensor via numpy: {e}")
                                  return obj
                          return obj
                     elif isinstance(obj, tuple):
@@ -1578,77 +2049,57 @@ def main():
                     elif isinstance(obj, list):
                         return [to_jax_recursive_final(x) for x in obj]
                     return obj
-                 
                  return to_jax_recursive_final(res)
-            
-            # Fallback if res not defined
             return None
 
     pipe.scheduler.step = debug_step
+    
+    # Monkeypatch prepare_latents (Keep as is)
+    original_prepare_latents = pipe.prepare_latents
+    def patched_prepare_latents(*args, **kwargs):
+        if pipe.transformer.config.in_channels == 65 and pipe.transformer.config.out_channels == 32:
+             if len(args) > 1:
+                 args_list = list(args)
+                 args_list[1] = 32
+                 args = tuple(args_list)
+                 if 'num_channels_latents' in kwargs: del kwargs['num_channels_latents']
+             else:
+                 kwargs['num_channels_latents'] = 32
+        return original_prepare_latents(*args, **kwargs)
+    pipe.prepare_latents = patched_prepare_latents
 
-    # Optimized JAX Scheduler Step
-    # JIT compile the math kernel for efficiency
-    pipe.scheduler.step = debug_step
-
-    # Optimized JAX Scheduler Step
-    # JIT compile the PURE math kernel for efficiency
+    # Fast Debug Step (Keep as is)
     @jax.jit
     def jax_euler_step(sample, model_output, sigma, sigma_next):
         dt = sigma_next - sigma
-        # Pure math: broadcasting should work if shapes match
         return sample + dt * model_output
 
     def fast_debug_step(model_output, timestep, sample, return_dict=True, generator=None):
         try:
-            # 1. Access Scheduler State
             scheduler = original_step.__self__
-            
-            # CRITICAL: Propagate Environment from Input to prevent Recompilation
             env = getattr(sample, 'env', getattr(model_output, 'env', torchax.default_env()))
 
-            # Helper: Unwrap to JAX
             def unwrap_to_jax(x):
-                # Check for explicit JAX tensor wrapper
-                if hasattr(x, '_jax_tensor'):
-                    return x._jax_tensor
-                # 'TorchaxTensor' often uses '_elem' to store the JAX array
-                if hasattr(x, '_elem'):
-                    return x._elem
-                
-                # Check if it's a Torch Tensor
-                if hasattr(x, 'cpu'):
-                     if x.device.type == 'cpu':
-                        return jnp.array(x.detach().numpy())
-                
-                # Primitives
-                if isinstance(x, (int, float)):
-                    return jnp.array(x)
-                
+                if hasattr(x, '_jax_tensor'): return x._jax_tensor
+                if hasattr(x, '_elem'): return x._elem
+                if hasattr(x, 'cpu') and x.device.type == 'cpu': return jnp.array(x.detach().numpy())
+                if isinstance(x, (int, float)): return jnp.array(x)
                 return x
 
             jax_model_output = unwrap_to_jax(model_output)
             jax_sample = unwrap_to_jax(sample)
             jax_sigmas = unwrap_to_jax(scheduler.sigmas)
 
-            # 2. Fix Spatial Layout (Permute/Reshape) - EAGER MODE
-
-
-            # 2. Fix Spatial Layout (Permute/Reshape) - EAGER MODE
-            # We do this in Python to ensure correct shapes are passed to JIT
-            # Heuristic: [B, PatchL, H_patch, W_full, PatchH] -> [B, C, F, H, W]
             jmo_shape = getattr(jax_model_output, 'shape', None)
             js_shape = getattr(jax_sample, 'shape', None)
 
             if jmo_shape is not None and js_shape is not None:
                  if jnp.prod(jnp.array(jmo_shape)) == jnp.prod(jnp.array(js_shape)):
                       if jmo_shape != js_shape:
-                           # print(f"DEBUG FAST: Reshaping {jmo_shape} -> {js_shape}")
                            if jmo_shape[-1] == 2 and jmo_shape[-2] == js_shape[-1]:
                                 jax_model_output = jnp.transpose(jax_model_output, (0, 1, 2, 4, 3))
-                           
                            jax_model_output = jax_model_output.reshape(js_shape)
 
-            # 3. Euler Step Logic (JAX)
             step_index = scheduler.step_index
             if step_index is None:
                  scheduler._init_step_index(timestep)
@@ -1657,71 +2108,92 @@ def main():
             sigma = jax_sigmas[step_index]
             sigma_next = jax_sigmas[step_index + 1]
             
-            # Execute Jitted Kernel (Shapes MUST match now)
             prev_sample_jax = jax_euler_step(jax_sample, jax_model_output, sigma, sigma_next)
             
-            # 4. Update State
             scheduler._step_index += 1
-            
-            # 5. Wrap & Return
-            print(f"DEBUG FAST: Success. EnvID: {id(env)}")
             res = (torchax.tensor.Tensor(prev_sample_jax, env),)
             
-            if not return_dict:
-                return res
+            if not return_dict: return res
             return res
 
         except Exception as e:
-            # Uncomment for visibility
             print(f"DEBUG: Fast Path failed: {e}. Fallback CPU.") 
             return debug_step(model_output, timestep, sample, return_dict, generator)
 
-    # Use the fast JAX step by default
-    # Use the fast JAX step by default
     pipe.scheduler.step = fast_debug_step
 
-    # REMOVED: Proactive scheduler state wrapping.
-    # Moving scheduler tensors to TorchaxTensor explicitly caused AssertionError during set_timesteps
-    # because simple CPU math (sigmas * scalar) triggered dispatch without valid env.
-    # We let scheduler run on CPU and convert to JAX on-the-fly in fast_debug_step.
-    
-    # print("Moving scheduler state to JAX device with explicit default_env...")
-    # env = torchax.default_env()
-    # for k, v in pipe.scheduler.__dict__.items():
-    #     if torch.is_tensor(v):
-    #          try:
-    #             # Use explicit wrapping to ensure environment consistency
-    #             # Bridge via Numpy -> JAX -> Torchax
-    #             if getattr(v, 'device', torch.device('cpu')).type == 'cpu':
-    #                 np_val = v.detach().numpy()
-    #             else:
-    #                 np_val = v.cpu().detach().numpy()
-    # 
-    #             jax_val = jnp.array(np_val)
-    #             # Use default_env explicitly
-    #             wrapped_v = torchax.tensor.Tensor(jax_val, env)
-    #             setattr(pipe.scheduler, k, wrapped_v)
-    #          except Exception as e:
-    #             print(f"Failed to move scheduler buffer {k} to jax: {e}")
-
-    print("Running inference...")
-    
     print("Running inference...")
     
     with mesh, torchax.default_env():
-        output = pipe(
+        start = time.perf_counter()
+        # Request LATENTS only
+        output_latents = pipe(
             prompt=args.prompt,
             height=args.height,
             width=args.width,
             num_frames=args.frames,
             num_inference_steps=args.num_inference_steps,
+            output_type="latent"
         ).frames[0]
+        
+        # JAX Decoding
+        print("Decoding latents with JAX VAE...")
+        
+        # Unwrap Latents
+        def unwrap(x):
+            if hasattr(x, 'jax'): return x.jax()
+            if hasattr(x, 'unwrap'): return x.unwrap()
+            if hasattr(x, '_elem'): return x._elem
+            return x
+        
+        jax_latents = unwrap(output_latents)
+        
+        # Check rank and adjust layout
+        # Expected from Diffusers: (C, T, H, W) for single batch item in frames[0]
+        # or (B, C, T, H, W) if it was a tensor.
+        
+        if jax_latents.ndim == 4:
+             # (C, T, H, W) -> (1, C, T, H, W)
+             jax_latents = jnp.expand_dims(jax_latents, 0)
+             
+        # Convert (B, C, T, H, W) -> (B, T, H, W, C) for JAX VAE
+        # Check for C=16 (Hunyuan 1.0) or C=32 (Hunyuan 1.5)
+        if jax_latents.ndim == 5 and jax_latents.shape[1] in [16, 32]: 
+             jax_latents = jnp.transpose(jax_latents, (0, 2, 3, 4, 1))
+        
+        latents_sharding = NamedSharding(mesh, P(None, None, None, 'sp', None))
+        jax_latents = jax.device_put(jax_latents, latents_sharding)
+        
+        # JAX splits Width on 'sp'.
+        # We MUST enforce output sharding to avoid gathering full video on each TPU (OOM).
+        # Output: (B, T, H, W, C)
+        video_sharding = NamedSharding(mesh, P(None, None, None, 'sp', None))
+        
+        @nnx.jit(out_shardings=video_sharding)
+        def decode_fn(model, x):
+             return model.decode(x)[0]
+        
+        decoded_videos = decode_fn(jax_vae, jax_latents)
+        
+        # Post-process
+        # (val / 2 + 0.5).clamp(0, 1)
+        decoded_videos = (decoded_videos / 2.0 + 0.5)
+        decoded_videos = jnp.clip(decoded_videos, 0.0, 1.0)
+ 
+        # Convert to numpy
+        output_cpu = np.array(decoded_videos)
+
+        print(f"Decoded shape: {output_cpu.shape}")
+        
+        # Usually (B, T, H, W, C)
+        output = output_cpu[0] # (T, H, W, C)
+        
         jax.effects_barrier()
         end = time.perf_counter()
         print(f"Inference time: {end - start:.4f}s")
         
         output_path = "hunyuan_output.mp4"
-        export_to_video(output, output_path, fps=15)
+        export_to_video(list(output), output_path, fps=24)
         print(f"Saved output to {output_path}")
 
 if __name__ == "__main__":

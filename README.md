@@ -24,6 +24,17 @@ python wan_tx_splash_attn.py
 
 3. [in progress] identify the right model to optimize.
 
+## update on TPU7x on 01/24/2026
+
+Just understand the HunYuanVideo is an old version.
+Modify the code to support HunyuanVideo1_5(floagt16/fp8) (check-in)
+
+```
+HunyuanVideo-1.5-Diffusers-720p_t2v:  246s 30steps in float16 on 8 chips
+Aquiles-ai/HunyuanVideo-1.5-720p-fp8: 145s 30steps in fp8     on 8 chips
+
+```
+
 # Progress:
 
 ```
