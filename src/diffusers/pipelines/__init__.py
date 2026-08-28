@@ -357,6 +357,7 @@ else:
         "WuerstchenPriorPipeline",
     ]
     _import_structure["wan"] = ["WanPipeline", "WanImageToVideoPipeline", "WanVideoToVideoPipeline"]
+    _import_structure["qwenimage"] = ["QwenImagePipeline", "QwenImageEditPipeline"]
 try:
     if not is_onnx_available():
         raise OptionalDependencyNotAvailable()
@@ -713,6 +714,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             TextToVideoZeroSDXLPipeline,
             VideoToVideoSDPipeline,
         )
+        from .qwenimage import QwenImageEditPipeline, QwenImagePipeline
         from .unclip import UnCLIPImageVariationPipeline, UnCLIPPipeline
         from .unidiffuser import (
             ImageTextPipelineOutput,

@@ -461,6 +461,11 @@ def _func_optionally_disable_offloading(_pipeline):
     return (is_model_cpu_offload, is_sequential_cpu_offload)
 
 
+def _pack_dict_with_prefix(state_dict, prefix):
+    sd_with_prefix = {f"{prefix}.{key}": value for key, value in state_dict.items()}
+    return sd_with_prefix
+
+
 class LoraBaseMixin:
     """Utility class for handling LoRAs."""
 
