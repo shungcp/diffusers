@@ -983,15 +983,21 @@ def load_wan_vae_fixed(pretrained_model_name_or_path: str, eval_shapes: dict, de
 
 ### Sharding VAE ###
 
-def _add_sharding_rule(vs: nnx.Variable, logical_axis_rules) -> nnx.Variable:
-  vs.set_metadata(sharding_rules=logical_axis_rules)
+def _add_sharding_rule(vs, logical_axis_rules):
+  # flax versions differ on how nnx.split() exposes state leaves under nnx.jit:
+  # newer flax (e.g. on TPU7x) yields nnx.Variable with .set_metadata(); older
+  # flax (this v6e-4 env's flax==0.10.5) yields nnx.VariableState with plain attrs.
+  if hasattr(vs, 'set_metadata'):
+    vs.set_metadata(sharding_rules=logical_axis_rules)
+  else:
+    vs.sharding_rules = logical_axis_rules
   return vs
 
 @nnx.jit(static_argnums=(1,), donate_argnums=(0,))
 def create_sharded_logical_model(model, logical_axis_rules):
   graphdef, state, rest_of_state = nnx.split(model, nnx.Param, ...)
   p_add_sharding_rule = functools.partial(_add_sharding_rule, logical_axis_rules=logical_axis_rules)
-  state = jax.tree.map(p_add_sharding_rule, state, is_leaf=lambda x: isinstance(x, nnx.Variable))
+  state = jax.tree.map(p_add_sharding_rule, state, is_leaf=lambda x: isinstance(x, (nnx.Variable, nnx.VariableState)))
   pspecs = nnx.get_partition_spec(state)
   sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
   model = nnx.merge(graphdef, sharded_state, rest_of_state)

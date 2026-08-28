@@ -1,0 +1,95 @@
+# Verified working requirements for this repo's torchax/JAX TPU scripts (NOT
+# torch_xla) on a single v6e-4 TPU VM: wan_tx_splash_attn.py (Wan2.1 T2V) and
+# qwen_image_edit_tx.py (Qwen-Image-Edit). Originally captured 2026-08-27 while
+# bringing up wan_tx_splash_attn.py; peft was added afterward for
+# qwen_image_edit_tx.py's --lightning_lora support.
+# Regenerated and validated 2026-08-27 with:
+#   python wan_tx_splash_attn.py --model_id Wan-AI/Wan2.1-T2V-1.3B-Diffusers --num_inference_steps 2
+#   python qwen_image_edit_tx.py --image <img> --prompt "add a rainbow in the sky" --num_inference_steps 40
+# torch is CPU-only on purpose: actual compute happens on TPU via torchax/JAX, torch is
+# just used as the tensor/module frontend, so no CUDA build is needed.
+#
+# Verified install procedure (re-tested end-to-end from a brand new venv on 2026-08-27,
+# confirmed a full run of wan_tx_splash_attn.py works with no manual intervention):
+#   1) pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+#        --index-url https://download.pytorch.org/whl/cpu
+#   2) pip install --no-deps -r requirements_v6e4_torchax.txt
+#   3) pip install -e <path-to-this-diffusers-repo>
+#
+# Step 2 MUST use --no-deps for the whole file, not just for maxdiffusion: this file is
+# a full `pip freeze` of an already-working, self-consistent environment, so every
+# transitive dependency is already pinned explicitly here. Without --no-deps, pip's
+# resolver evaluates maxdiffusion's own setup.py, which pins huggingface-hub==0.30.0 --
+# that conflicts with transformers' requirement of huggingface-hub>=0.34.0 (also pinned
+# in this file) and pip aborts with ResolutionImpossible. huggingface-hub==0.30.0 is an
+# overly strict/stale pin in maxdiffusion's metadata; 0.34.4 (pinned below) works fine
+# in practice.
+#
+# NOTE: this repo's own top-level requirements.txt is stale (dates from the torch_xla
+# era, before the switch to torchax) and pins jax to an unreachable April-2025 nightly
+# wheel plus torch-xla, which is not what wan_tx_splash_attn.py actually uses.
+
+absl-py==2.5.0
+accelerate==1.14.0
+aiofiles==25.1.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+chex==0.1.90
+etils==1.13.0
+filelock==3.32.4
+flax==0.10.5
+fsspec==2026.7.0
+ftfy==6.3.1
+hf-xet==1.6.0
+huggingface-hub==0.34.4
+humanize==4.16.0
+idna==3.19
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+importlib_metadata==9.0.0
+importlib_resources==7.1.0
+jax==0.6.2
+jaxlib==0.6.2
+Jinja2==3.1.6
+libtpu==0.0.17
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+maxdiffusion @ git+https://github.com/yuyanpeng-google/maxdiffusion.git@57acbdbff4ae88fed4f36acde895902c520fac85
+mdurl==0.1.2
+ml_dtypes==0.6.0
+mpmath==1.3.0
+msgpack==1.2.2
+networkx==3.4.2
+numpy==2.2.6
+opt_einsum==3.4.0
+optax==0.2.8
+orbax-checkpoint==0.11.39
+packaging==26.3
+peft==0.20.0
+pillow==12.3.0
+protobuf==7.36.0
+psutil==7.2.2
+Pygments==2.21.0
+PyYAML==6.0.3
+regex==2026.7.19
+requests==2.34.2
+rich==15.0.0
+safetensors==0.8.0
+scipy==1.15.3
+simplejson==4.1.2
+sympy==1.14.0
+tensorstore==0.1.78
+tokenizers==0.22.2
+toolz==1.1.0
+torch==2.8.0+cpu
+torchaudio==2.8.0+cpu
+torchax @ git+https://github.com/pytorch/xla.git@a0f8b7131162d4ffc4011ddae0453f2bd69821bd#subdirectory=torchax
+torchvision==0.23.0+cpu
+tqdm==4.70.0
+transformers==4.57.1
+treescope==0.1.10
+typing_extensions==4.16.0
+urllib3==2.7.0
+uvloop==0.22.1
+wcwidth==0.8.2
+zipp==4.1.0
