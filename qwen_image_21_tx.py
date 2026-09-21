@@ -76,6 +76,7 @@ Things deliberately not done, with the measurements behind them:
 
 import argparse
 import contextlib
+import os
 import functools
 import math
 import re
@@ -677,6 +678,9 @@ def parse_args():
                  help="Keep only the vision tower on CPU")
   p.add_argument("--vae_decode_eager", action="store_true",
                  help="Skip compiling the VAE decode (it then runs op by op)")
+  p.add_argument("--compile_cache_dir", type=str,
+                 default="~/.cache/qwen_image_21_jax",
+                 help="Persistent XLA compilation cache; \"\" disables it")
   return p.parse_args()
 
 
@@ -684,6 +688,18 @@ def main():
   args = parse_args()
   print(args)
   torch.set_default_dtype(torch.bfloat16)
+
+  # Without this a cold process pays the whole XLA compile -- 54 s for
+  # text-to-image, 169 s for an edit -- before the first image. The cache is
+  # keyed on the HLO, so it survives restarts and only misses when a shape or
+  # a flag changes.
+  if args.compile_cache_dir:
+    cache = os.path.expanduser(args.compile_cache_dir)
+    os.makedirs(cache, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", cache)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+    print(f"Compilation cache: {cache}")
 
   from diffusers import QwenImage21Pipeline
 
