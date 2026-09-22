@@ -467,6 +467,25 @@ def generate(prompt, height=1024, width=1024, num_inference_steps=20, seed=42,
     # slice the scheduler wants.
     return model(_joint(latents), embeds, timestep, meta, kv_cache=caches)
 
+  @nnx.jit
+  def denoise_scan(model, latents, embeds, steps, caches):
+    """Every remaining step inside one program.
+
+    Worth about 4%: the gaps between twenty separate launches, not the
+    dispatch itself, which is already asynchronous. `steps` is the stacked
+    `(sigma, sigma_next)` pairs.
+    """
+    def body(x, pair):
+      sigma, sigma_next = pair
+      if caches is None:
+        pred = model(_joint(x), embeds, sigma[None], meta)[:, -x.shape[1]:]
+      else:
+        pred = model(_joint(x), embeds, sigma[None], meta, kv_cache=caches)
+      return x + (sigma_next - sigma) * pred, None
+
+    out, _ = jax.lax.scan(body, latents, steps)
+    return out
+
   import json
   with open(os.path.join(snapshot, "vae", "config.json")) as handle:
     vae_config = json.load(handle)
@@ -488,15 +507,17 @@ def generate(prompt, height=1024, width=1024, num_inference_steps=20, seed=42,
     t0 = time.perf_counter()
     x = latents
     caches = None
-    for i in range(num_inference_steps):
-      timestep = jnp.asarray([sigmas[i]], jnp.float32)
-      if not kv_cache:
-        noise_pred = denoise(model, x, prompt_embeds, timestep)
-      elif i == 0:
-        noise_pred, caches = denoise_extract(model, x, prompt_embeds, timestep)
-      else:
-        noise_pred = denoise_cached(model, x, prompt_embeds, timestep, caches)
-      x = x + (sigmas[i + 1] - sigmas[i]) * noise_pred
+    first = 0
+    if kv_cache:
+      # Step 0 fills the cache and cannot be part of the scan.
+      noise_pred, caches = denoise_extract(
+          model, x, prompt_embeds, jnp.asarray([sigmas[0]], jnp.float32))
+      x = x + (sigmas[1] - sigmas[0]) * noise_pred
+      first = 1
+    pairs = jnp.stack([jnp.asarray(sigmas[first:num_inference_steps]),
+                       jnp.asarray(sigmas[first + 1:num_inference_steps + 1])],
+                      axis=1)
+    x = denoise_scan(model, x, prompt_embeds, pairs, caches)
     x = jax.block_until_ready(x)
     t_steps = time.perf_counter() - t0
     t0 = time.perf_counter()

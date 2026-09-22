@@ -219,6 +219,28 @@ def _build_modules():
     def __call__(self, x):
       return self.out(jax.nn.silu(self.gate_layer(x)) * self.proj(x))
 
+  def _shard_sequence(x, enabled):
+    """Sharding-constrain the residual stream along the sequence axis.
+
+    Megatron-style sequence parallel. It does not move fewer bytes -- a
+    reduce-scatter plus a later all-gather is the same traffic as one
+    all-reduce -- but everything between the two sub-layers (the norms, the
+    modulation, the tanh, the residual add) then runs on 1/N of the tokens.
+    Those are 25% of the step and 90% memory-bound, so that is where the
+    win, if any, has to come from.
+    """
+    if not enabled:
+      return x
+    return jax.lax.with_sharding_constraint(
+        x, jax.sharding.PartitionSpec(None, "tensor", None))
+
+  def _gather_sequence(x, enabled):
+    """Back to a full sequence, for the column-parallel projections."""
+    if not enabled:
+      return x
+    return jax.lax.with_sharding_constraint(
+        x, jax.sharding.PartitionSpec(None, None, None))
+
   class Block(nnx.Module):
     """One single-stream block. Modulation comes from the parent."""
 
@@ -238,16 +260,18 @@ def _build_modules():
 
     def __call__(self, x, modulation, rotary_emb, attention_mask=None,
                  target_token_mask=None, segments=None, cache=None,
-                 extract_prefix=None):
+                 extract_prefix=None, sequence_parallel=False):
+      sp = sequence_parallel
       mod1, mod2 = jnp.split(modulation, 2, axis=-1)
       h, gate1 = self._modulate(self.img_norm1(x), mod1, target_token_mask)
-      attended = self.attn(h, rotary_emb, attention_mask, segments, cache,
-                           extract_prefix)
+      attended = self.attn(_gather_sequence(h, sp), rotary_emb, attention_mask,
+                           segments, cache, extract_prefix)
       attended, new_cache = (attended if extract_prefix is not None
                              else (attended, None))
-      x = x + jnp.tanh(gate1) * attended
+      x = x + jnp.tanh(gate1) * _shard_sequence(attended, sp)
       h2, gate2 = self._modulate(self.img_norm2(x), mod2, target_token_mask)
-      x = x + jnp.tanh(gate2) * self.img_mlp(h2)
+      mlp = self.img_mlp(_gather_sequence(h2, sp))
+      x = x + jnp.tanh(gate2) * _shard_sequence(mlp, sp)
       return x if extract_prefix is None else (x, new_cache)
 
   class TextProjection(nnx.Module):
@@ -301,10 +325,12 @@ def _build_modules():
     def __init__(self, in_channels=64, out_channels=64, num_layers=32,
                  attention_head_dim=128, num_attention_heads=32,
                  context_in_dim=4096, mlp_ratio=3, eps=1e-6,
-                 causal_condition=True, *, dtype, rngs):
+                 causal_condition=True, sequence_parallel=False, *,
+                 dtype, rngs):
       dim = num_attention_heads * attention_head_dim
       self.inner_dim = dim
       self.causal_condition = causal_condition
+      self.sequence_parallel = sequence_parallel
       self.time_text_embed = TimestepEmbeddings(dim, dtype=dtype, rngs=rngs)
       self.txt_in = TextProjection(context_in_dim, dim, eps, dtype=dtype, rngs=rngs)
       self.img_in = Linear(in_channels, dim, dtype=dtype, rngs=rngs)
@@ -378,12 +404,12 @@ def _build_modules():
         out = block(joint, modulation, rotary, mask, target_token_mask,
                     segments,
                     None if kv_cache is None else kv_cache[index],
-                    prefix if extract else None)
+                    prefix if extract else None, self.sequence_parallel)
         joint, cache = out if extract else (out, None)
         caches.append(cache)
 
       joint = self.norm_out(joint, temb, target_token_mask)
-      output = self.proj_out(joint)
+      output = _gather_sequence(self.proj_out(joint), self.sequence_parallel)
       return (output, caches) if extract else output
 
   return Block, Transformer
@@ -960,7 +986,8 @@ def load_transformer(model, model_dir, mesh=None):
   return model
 
 
-def bench(height=1024, width=1024, text_len=512, steps=3):
+def bench(height=1024, width=1024, text_len=512, steps=3,
+          sequence_parallel=False):
   """Time one denoising step of the real 7.12B DiT on whatever JAX sees.
 
   Weights are zeros -- TPU matmul timing does not depend on values -- so this
@@ -985,7 +1012,8 @@ def bench(height=1024, width=1024, text_len=512, steps=3):
   print(f"{height}x{width}: {target} image tokens, joint sequence {seq}")
 
   t0 = time.perf_counter()
-  model = Transformer(dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
+  model = Transformer(dtype=jnp.bfloat16,
+                      sequence_parallel=sequence_parallel, rngs=nnx.Rngs(0))
   chips = jax.device_count()
   if chips > 1:
     # Auto axes, not Explicit: with explicit sharding a row-parallel matmul
@@ -994,6 +1022,10 @@ def bench(height=1024, width=1024, text_len=512, steps=3):
     mesh = jax.make_mesh((chips,), ("tensor",),
                          axis_types=(jax.sharding.AxisType.Auto,))
     model = shard_model(model, mesh)
+    if sequence_parallel:
+      # `with_sharding_constraint` needs a mesh in context to resolve a
+      # PartitionSpec against.
+      jax.set_mesh(mesh)
   jax.block_until_ready(nnx.state(model, nnx.Param))
   print(f"weights on {chips} chip(s) in {time.perf_counter() - t0:.1f}s")
 
@@ -1018,7 +1050,7 @@ def main():
   import sys
 
   if "--bench" in sys.argv:
-    return 0 if bench() else 1
+    return 0 if bench(sequence_parallel="--sp" in sys.argv) else 1
   _patch_dispatch()
   Block, Transformer = _build_modules()
   ok = test_block(Block)
