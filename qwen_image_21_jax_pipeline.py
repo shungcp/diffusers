@@ -327,7 +327,8 @@ def encode_prompt_jax(snapshot, prompts, images=None, dtype="bfloat16",
 
 def generate(prompt, height=1024, width=1024, num_inference_steps=20, seed=42,
              snapshot=None, dtype="bfloat16", embeds_cache=None, mesh=None,
-             runs=1, text_encoder="jax", image=None, output_resolution=1024):
+             runs=1, text_encoder="jax", image=None, output_resolution=1024,
+             kv_cache=True):
   """One image, start to finish. Returns uint8 RGB `(height, width, 3)`.
 
   With `image`, the condition image is resized to `output_resolution`'s area
@@ -445,13 +446,26 @@ def generate(prompt, height=1024, width=1024, num_inference_steps=20, seed=42,
     print(f"condition image {condition['size']} -> "
           f"{condition_latents.shape[1]} latent tokens")
 
+  def _joint(latents):
+    return latents if condition_latents is None else jnp.concatenate(
+        [condition_latents, latents], axis=1)
+
   @nnx.jit
   def denoise(model, latents, embeds, timestep):
     target = latents.shape[1]
-    joint = latents if condition_latents is None else jnp.concatenate(
-        [condition_latents, latents], axis=1)
-    out = model(joint, embeds, timestep, meta)
-    return out[:, -target:]
+    return model(_joint(latents), embeds, timestep, meta)[:, -target:]
+
+  @nnx.jit
+  def denoise_extract(model, latents, embeds, timestep):
+    target = latents.shape[1]
+    out, caches = model(_joint(latents), embeds, timestep, meta, extract=True)
+    return out[:, -target:], caches
+
+  @nnx.jit
+  def denoise_cached(model, latents, embeds, timestep, caches):
+    # The cached program returns the target rows only, which is already the
+    # slice the scheduler wants.
+    return model(_joint(latents), embeds, timestep, meta, kv_cache=caches)
 
   import json
   with open(os.path.join(snapshot, "vae", "config.json")) as handle:
@@ -473,9 +487,15 @@ def generate(prompt, height=1024, width=1024, num_inference_steps=20, seed=42,
       t_text = time.perf_counter() - t0
     t0 = time.perf_counter()
     x = latents
+    caches = None
     for i in range(num_inference_steps):
       timestep = jnp.asarray([sigmas[i]], jnp.float32)
-      noise_pred = denoise(model, x, prompt_embeds, timestep)
+      if not kv_cache:
+        noise_pred = denoise(model, x, prompt_embeds, timestep)
+      elif i == 0:
+        noise_pred, caches = denoise_extract(model, x, prompt_embeds, timestep)
+      else:
+        noise_pred = denoise_cached(model, x, prompt_embeds, timestep, caches)
       x = x + (sigmas[i + 1] - sigmas[i]) * noise_pred
     x = jax.block_until_ready(x)
     t_steps = time.perf_counter() - t0
@@ -504,6 +524,8 @@ def main():
   parser.add_argument("--dtype", type=str, default="bfloat16")
   parser.add_argument("--embeds-cache", type=str, default=None,
                       help="npz to reuse host text embeddings across runs")
+  parser.add_argument("--no-kv-cache", action="store_true",
+                      help="recompute the prefix every step, for comparison")
   parser.add_argument("--text-encoder", choices=("jax", "host"), default="jax",
                       help="'host' runs Qwen3-VL through PyTorch; needed for "
                            "condition images until the vision tower lands")
@@ -535,7 +557,8 @@ def main():
   rgb = generate(args.prompt, args.height, args.width,
                  args.num_inference_steps, args.seed, dtype=args.dtype,
                  embeds_cache=args.embeds_cache, runs=args.runs,
-                 text_encoder=args.text_encoder, image=condition)
+                 text_encoder=args.text_encoder, image=condition,
+                 kv_cache=not args.no_kv_cache)
   Image.fromarray(rgb).save(args.output)
   print(f"wrote {args.output}")
   return 0

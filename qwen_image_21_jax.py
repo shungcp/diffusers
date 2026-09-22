@@ -168,7 +168,15 @@ def _build_modules():
       self.norm_k = RMSNorm(dim_head, eps)
       self.to_out = Linear(inner, dim, dtype=dtype, rngs=rngs)
 
-    def __call__(self, x, rotary_emb, attention_mask=None, segments=None):
+    def __call__(self, x, rotary_emb, attention_mask=None, segments=None,
+                 cache=None, extract_prefix=None):
+      """`cache` is a `(key, value)` pair for the prefix, already rotated.
+
+      With one, `x` holds only the target rows: the prefix keys and values
+      are prepended instead of recomputed. `extract_prefix` asks for the
+      first `n` rows of this layer's keys and values back, to become that
+      cache on a later step.
+      """
       b, s, _ = x.shape
       q = self.to_q(x).reshape(b, s, self.heads, -1)
       k = self.to_k(x).reshape(b, s, self.heads, -1)
@@ -178,6 +186,11 @@ def _build_modules():
       if rotary_emb is not None:
         q = apply_rope(q, rotary_emb)
         k = apply_rope(k, rotary_emb)
+      if cache is not None:
+        k = jnp.concatenate([cache[0].astype(k.dtype), k], axis=1)
+        v = jnp.concatenate([cache[1].astype(v.dtype), v], axis=1)
+      new_cache = None if extract_prefix is None else (
+          k[:, :extract_prefix], v[:, :extract_prefix])
       if segments is None:
         out = jax.nn.dot_product_attention(q, k, v, mask=attention_mask,
                                            scale=self.scale)
@@ -194,7 +207,8 @@ def _build_modules():
                                           v[:, :end], mask=mask,
                                           scale=self.scale)
              for (start, end), mask in segments], axis=1)
-      return self.to_out(out.reshape(b, s, -1))
+      out = self.to_out(out.reshape(b, s, -1))
+      return out if extract_prefix is None else (out, new_cache)
 
   class SwiGLU(nnx.Module):
     def __init__(self, hidden, mlp_hidden, *, dtype, rngs):
@@ -223,13 +237,18 @@ def _build_modules():
       return x * (1 + scale), gate
 
     def __call__(self, x, modulation, rotary_emb, attention_mask=None,
-                 target_token_mask=None, segments=None):
+                 target_token_mask=None, segments=None, cache=None,
+                 extract_prefix=None):
       mod1, mod2 = jnp.split(modulation, 2, axis=-1)
       h, gate1 = self._modulate(self.img_norm1(x), mod1, target_token_mask)
-      x = x + jnp.tanh(gate1) * self.attn(h, rotary_emb, attention_mask,
-                                          segments)
+      attended = self.attn(h, rotary_emb, attention_mask, segments, cache,
+                           extract_prefix)
+      attended, new_cache = (attended if extract_prefix is not None
+                             else (attended, None))
+      x = x + jnp.tanh(gate1) * attended
       h2, gate2 = self._modulate(self.img_norm2(x), mod2, target_token_mask)
-      return x + jnp.tanh(gate2) * self.img_mlp(h2)
+      x = x + jnp.tanh(gate2) * self.img_mlp(h2)
+      return x if extract_prefix is None else (x, new_cache)
 
   class TextProjection(nnx.Module):
     def __init__(self, context_in_dim, hidden, eps=1e-6, *, dtype, rngs):
@@ -302,7 +321,19 @@ def _build_modules():
       self.norm_out = AdaLayerNormContinuous(dim, dim, eps, dtype=dtype, rngs=rngs)
       self.proj_out = Linear(dim, out_channels, dtype=dtype, rngs=rngs)
 
-    def __call__(self, hidden_states, encoder_hidden_states, timestep, meta):
+    def __call__(self, hidden_states, encoder_hidden_states, timestep, meta,
+                 kv_cache=None, extract=False):
+      """`extract` also returns the prefix keys and values, one pair per
+      block; passing them back as `kv_cache` on a later step runs only the
+      target rows.
+
+      That is sound only because `causal_condition` modulates text and
+      condition-image tokens from `t = 0`, which makes their activations --
+      and so their keys and values -- the same at every timestep. It is also
+      why the saving is all in the edit path: at 1024 with a condition image
+      the prefix is half the joint sequence, where for text-to-image it is
+      the prompt alone.
+      """
       batch = hidden_states.shape[0]
       hidden_states = self.img_in(hidden_states)
       encoder_hidden_states = self.txt_in(encoder_hidden_states)
@@ -326,13 +357,34 @@ def _build_modules():
       temb = self.time_text_embed(timestep, joint.dtype)
       modulation = self.modulation(jax.nn.silu(temb))
 
-      for block in self.transformer_blocks:
-        joint = block(joint, modulation, meta["rotary_emb"],
-                      meta.get("attention_mask"), target_token_mask,
-                      meta.get("segments"))
+      prefix = meta["prefix_len"]
+      rotary = meta["rotary_emb"]
+      segments = meta.get("segments")
+      mask = meta.get("attention_mask")
+      if kv_cache is not None:
+        # Decode: only the target rows are queries. Their attention rule --
+        # causal to everything before them, bidirectional within their own
+        # block -- degenerates to "attend to all of it", so the segments go
+        # away and only prompt padding is left to mask.
+        joint = joint[:, prefix:]
+        rotary = rotary[prefix:]
+        segments = None
+        mask = meta.get("key_valid")
+        if target_token_mask is not None:
+          target_token_mask = target_token_mask[prefix:]
+
+      caches = []
+      for index, block in enumerate(self.transformer_blocks):
+        out = block(joint, modulation, rotary, mask, target_token_mask,
+                    segments,
+                    None if kv_cache is None else kv_cache[index],
+                    prefix if extract else None)
+        joint, cache = out if extract else (out, None)
+        caches.append(cache)
 
       joint = self.norm_out(joint, temb, target_token_mask)
-      return self.proj_out(joint)
+      output = self.proj_out(joint)
+      return (output, caches) if extract else output
 
   return Block, Transformer
 
@@ -484,6 +536,13 @@ def build_metadata(img_mask, img_shapes, encoder_hidden_states_mask=None,
       "target_tokens": block_lengths[-1],
       "rotary_emb": rotary_emb,
       "segments": tuple(segments),
+      # Everything before the target image. Its activations do not depend on
+      # the timestep, so its keys and values can be cached across steps.
+      "prefix_len": int((~target_token_mask).sum()),
+      # What a cached step needs instead of `segments`: target rows attend
+      # to the whole sequence, so only prompt padding is left.
+      "key_valid": (None if key_valid is None
+                    else key_valid[:, None, None, :]),
   }
   if dense_mask:
     # The unsegmented form, kept for cross-checking the segmented one.
@@ -710,6 +769,55 @@ def test_transformer(Transformer):
                  jax_model(*args, to_device(dense))) and ok
 
 
+def test_kv_cache(Transformer):
+  """A cached step must equal the same step computed from scratch.
+
+  The cache is extracted at one timestep and used at another, which is the
+  claim that matters: `causal_condition` modulates the prefix from `t = 0`,
+  so its keys and values are the same at every step. Extracting and reusing
+  at the *same* timestep would pass even if that were false.
+  """
+  import jax.numpy as jnp
+  import torch
+  from flax import nnx
+  from diffusers import QwenImage21Transformer2DModel
+
+  torch.manual_seed(0)
+  config = dict(in_channels=16, out_channels=16, num_layers=2,
+                attention_head_dim=128, num_attention_heads=2,
+                context_in_dim=64, mlp_ratio=3, eps=1e-6,
+                causal_condition=True)
+  img_shapes = [(1, 2, 2), (1, 4, 4)]
+  batch, text_len = 1, 6
+  row = np.zeros(text_len + math.prod(img_shapes[-1]) // 4, bool)
+  row[3] = True
+  row[text_len:] = True
+  img_mask = np.tile(row, (batch, 1))
+  ehs_mask = np.ones((batch, text_len), bool)
+  ehs_mask[:, -1] = False
+
+  torch_model = QwenImage21Transformer2DModel(**config).eval().float()
+  with torch.no_grad():
+    for block in torch_model.transformer_blocks:
+      block.attn.norm_q.weight.normal_(1, 0.1)
+      block.attn.norm_k.weight.normal_(1, 0.1)
+  jax_model = Transformer(**config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+  copy_transformer_weights(jax_model, torch_model)
+
+  rng = np.random.default_rng(0)
+  latents = jnp.asarray(rng.standard_normal(
+      (batch, sum(math.prod(s) for s in img_shapes), 16), dtype=np.float32))
+  prompt = jnp.asarray(rng.standard_normal(
+      (batch, text_len, 64), dtype=np.float32) * 0.1)
+  meta = to_device(build_metadata(img_mask, img_shapes, ehs_mask))
+
+  early, late = jnp.asarray([0.9]), jnp.asarray([0.3])
+  _, caches = jax_model(latents, prompt, early, meta, extract=True)
+  cached = jax_model(latents, prompt, late, meta, kv_cache=caches)
+  full = jax_model(latents, prompt, late, meta)[:, meta["prefix_len"]:]
+  return _report("kv cache", np.asarray(full), cached)
+
+
 def test_real_config(Transformer):
   """The shipped config, by shape only.
 
@@ -915,6 +1023,7 @@ def main():
   Block, Transformer = _build_modules()
   ok = test_block(Block)
   ok &= test_transformer(Transformer)
+  ok &= test_kv_cache(Transformer)
   ok &= test_real_config(Transformer)
   print("all match" if ok else "FAILED")
   return 0 if ok else 1
