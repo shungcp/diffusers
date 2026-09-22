@@ -27,8 +27,11 @@ where the backports they were written against still are.
 
 What is on device: the DiT (tensor-parallel), the VAE decode, and all of
 Qwen3-VL -- its 36 decoder layers tensor-parallel, its vision tower
-replicated. Measured on v6e-8 at 1024x1024, 20 steps: 1.65-1.70 s for
-text-to-image and 3.48-3.57 s for an edit, against 183 s and 450 s on CPU.
+replicated. Measured on v6e-8 at 1024x1024, 20 steps: 1.36-1.38 s for
+text-to-image and 3.03-3.28 s for an edit, against 183 s and 450 s on CPU.
+
+Steady state, with the first run's compilation discarded; ``--runs 4``
+reproduces it.
 
 Three things had to be restructured to get there, each because some shape
 depends on tensor *contents* and so cannot be traced.
